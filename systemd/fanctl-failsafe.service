@@ -1,0 +1,10 @@
+[Unit]
+Description=Hand fan control back to the iDRAC at boot (before fanctl starts)
+Before=fanctl.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fanctl auto
+
+[Install]
+WantedBy=multi-user.target

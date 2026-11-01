@@ -1,0 +1,19 @@
+[Unit]
+Description=R730xd fan controller (model-based fan duty + iDRAC power cap)
+After=fanctl-failsafe.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/fanctl.env
+ExecStart=/usr/local/bin/fanctl
+# runs after every stop, crash or watchdog kill: fans back to the iDRAC
+ExecStopPost=/usr/local/bin/fanctl auto
+# the control loop pings every INTERVAL; silent for 30 s -> killed and restarted
+WatchdogSec=30
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
