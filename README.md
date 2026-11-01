@@ -60,6 +60,9 @@ in control:
 | failure | what happens |
 |---|---|
 | sensor read fails, BMC times out | fans → iDRAC auto, retried next cycle |
+| a temperature sensor stops reporting, or reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
+| duty or power cap computes to NaN/Inf | fans → iDRAC auto |
+| invalid settings (e.g. `INTERVAL` > 20 s, `FAN_MAX` > 100, limits out of order) | refuses to start; fans stay with the iDRAC |
 | a known drive stops reporting, drive data stale | fans → iDRAC auto |
 | panic in a control cycle (bug, unexpected BMC reply) | recovered: fans → iDRAC auto, next cycle retries |
 | panic in the drive reader | recovered and restarted; stale drive data → iDRAC auto meanwhile |

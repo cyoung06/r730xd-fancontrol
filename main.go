@@ -17,6 +17,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"math"
@@ -147,6 +148,42 @@ func loadConfig() {
 	case "curve", "model", "fixed", "auto":
 	default:
 		log.Fatalf("MODE must be curve, model, fixed or auto")
+	}
+	validateConfig()
+}
+
+// validateConfig refuses settings that would make the controller unsafe or stall the loop past the
+// systemd watchdog. A refused config exits, and systemd leaves the fans with the iDRAC.
+func validateConfig() {
+	check := func(ok bool, f string, a ...any) {
+		if !ok {
+			log.Fatalf("config: "+f, a...)
+		}
+	}
+	pct := func(v float64) bool { return v >= 0 && v <= 100 }
+	check(interval >= time.Second && interval <= 20*time.Second, "INTERVAL must be 1-20 s (the systemd watchdog is 30 s)")
+	check(hddInterval >= 10*time.Second && hddRescan >= hddInterval, "need HDD_INTERVAL >= 10 s and HDD_RESCAN >= HDD_INTERVAL")
+	check(reassert >= interval, "REASSERT must be >= INTERVAL")
+	check(minPct >= 1 && minPct <= 100, "MIN_PCT must be 1-100")
+	check(fixedPct0 >= 5 && fixedPct0 <= 100, "FIXED_PCT must be 5-100")
+	check(fanMax == 0 || (fanMax >= minPct && fanMax <= 100), "FAN_MAX must be 0 or MIN_PCT-100")
+	check(emergencyPct >= minPct && emergencyPct <= 100, "EMERGENCY_PCT must be MIN_PCT-100")
+	check(cpuTarget-modelMargin > 20 && cpuTarget < cpuLimit && cpuLimit < cpuAuto && cpuAuto <= 100,
+		"need 20 < CPU_TARGET-MODEL_MARGIN, CPU_TARGET < CPU_LIMIT < CPU_AUTO <= 100")
+	check(hddAuto > 0 && hddAuto <= 70 && exhaustAuto > 0 && exhaustAuto <= 80, "HDD_AUTO must be <= 70, EXHAUST_AUTO <= 80")
+	check(pcapMin >= 100 && pcapMin < pcapMax && pcapStep > 0, "need 100 <= PCAP_MIN < PCAP_MAX and PCAP_STEP > 0")
+	check(ki >= 0 && iMax >= 0 && kw >= 0, "MODEL_KI, MODEL_I_MAX, PCAP_KW must be >= 0")
+	for name, c := range map[string]curve{"CPU_CURVE": cpuCurve, "HDD_CURVE": hddCurve, "EXHAUST_CURVE": exhaustCurve, "WARM_CURVE": warmCurve} {
+		for _, p := range c {
+			check(pct(p.y), "%s: duty %g outside 0-100", name, p.y)
+		}
+	}
+	for i, p := range fanRPMTab {
+		check(pct(p.x) && p.y > 0 && (i == 0 || (p.x > fanRPMTab[i-1].x && p.y > fanRPMTab[i-1].y)),
+			"FAN_RPM_TABLE must rise in both duty and rpm")
+	}
+	for i, m := range cpuModels {
+		check(m.pb >= 0 && m.r0 >= 0 && m.k > 0 && m.n > 0 && m.scale > 0, "CPU%d_MODEL: need pb,r0 >= 0 and k,n,scale > 0", i+1)
 	}
 }
 
@@ -346,7 +383,8 @@ func readInt(p string) (int64, error) {
 type controller struct {
 	bmc     *BMC
 	sensors []Sensor
-	kick    chan struct{} // ask the drive goroutine for an early re-read
+	expect  map[string]bool // temperature sensors seen on the first good read
+	kick    chan struct{}   // ask the drive goroutine for an early re-read
 
 	current             float64 // last duty sent; valid when manual
 	manual              bool
@@ -393,6 +431,28 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 	if len(temps) == 0 || len(fans) == 0 {
 		c.sensors = nil // walk the repository again next time
 		return nil, nil, 0, fmt.Errorf("empty sensor read")
+	}
+	// a temperature that drops out must not look like a cool part, and a garbage value must not
+	// either: both fail the cycle (-> iDRAC)
+	if c.expect == nil {
+		if hottestCPU(temps) == 0 {
+			return nil, nil, 0, fmt.Errorf("no CPU temperature")
+		}
+		c.expect = map[string]bool{}
+		for k := range temps {
+			c.expect[k] = true
+		}
+		log.Printf("temperature sensors: %s", fmtTemps(temps))
+	}
+	for k := range c.expect {
+		if _, ok := temps[k]; !ok {
+			return nil, nil, 0, fmt.Errorf("temperature %s stopped reporting", k)
+		}
+	}
+	for k, v := range temps {
+		if !(v > 0 && v < 127) {
+			return nil, nil, 0, fmt.Errorf("implausible %s reading %g C", k, v)
+		}
 	}
 	return temps, fans, watts, nil
 }
@@ -503,6 +563,9 @@ func (c *controller) step() error {
 					want = math.Max(pcapMin, want)
 				}
 				if !c.capSet || math.Abs(want-c.lastCap) >= pcapStep || (want == pcapMax) != (c.lastCap == pcapMax) {
+					if math.IsNaN(want) || math.IsInf(want, 0) {
+						return fmt.Errorf("power cap computed as %v", want)
+					}
 					w := int(math.Round(want))
 					if err := c.bmc.SetPowerCap(w); err != nil {
 						return err
@@ -566,6 +629,9 @@ func (c *controller) step() error {
 		st.Unlock()
 	} else if !c.manual || math.Round(r.target) != math.Round(c.current) || time.Since(c.sentAt) >= reassert {
 		// re-sent periodically: retakes the fans after an iDRAC reset
+		if math.IsNaN(r.target) || math.IsInf(r.target, 0) { // int(NaN) is undefined: could mean 0 %
+			return fmt.Errorf("duty computed as %v", r.target)
+		}
 		pct := max(0, min(100, int(r.target)))
 		if err := c.bmc.FanDuty(pct); err != nil {
 			return err
@@ -736,7 +802,7 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 // control: /control?token=..&mode=curve|auto|fixed|model[&pct=N] - switch mode at runtime.
 func control(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	if controlToken == "" || q.Get("token") != controlToken {
+	if controlToken == "" || subtle.ConstantTimeCompare([]byte(q.Get("token")), []byte(controlToken)) != 1 {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -765,7 +831,9 @@ func control(w http.ResponseWriter, r *http.Request) {
 // serve listens on addr, retrying until the address exists (the LAN address can come up after us).
 func serve(addr string, h http.Handler) {
 	for {
-		err := http.ListenAndServe(addr, h)
+		srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, MaxHeaderBytes: 8 << 10}
+		err := srv.ListenAndServe()
 		log.Printf("http %s: %v (retrying)", addr, err)
 		time.Sleep(10 * time.Second)
 	}
