@@ -44,6 +44,7 @@ fanctl inverts this model to get the fan RPM, and from that the duty, that holds
   - The CPU never pushes the fans past `FAN_MAX`.
   - Instead, the DCMI power limit is set to the most power that still holds `CPU_TARGET` at `FAN_MAX`, plus a correction that tightens while the CPU stays above target.
   - The cap is verified by reading it back. It is never deactivated, because on iDRAC8 a later activate silently fails, so "no cap" is `PCAP_MAX` (586 W).
+  - The exception action is forced to "no action" (never a hard power-off), and leaving model mode lifts the cap back to `PCAP_MAX`.
 - **Emergency:** at `CPU_LIMIT` the fans jump to `EMERGENCY_PCT` at once. Above that, the `*_AUTO` limits hand control to the iDRAC.
 
 > **The default model parameters were fitted on one specific machine.** That's my R730xd, with
@@ -60,15 +61,19 @@ in control:
 | failure | what happens |
 |---|---|
 | sensor read fails, BMC times out | fans → iDRAC auto, retried next cycle |
-| a temperature sensor stops reporting, or reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
+| a temperature sensor stops reporting, a `REQUIRED_TEMPS` sensor has no reading, or one reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
+| a fan disappears or drops below `FAN_MIN_RPM` | fans → iDRAC auto (it compensates with the others) |
+| fewer than `HDD_MIN` drives visible; a drive missing from one rescan | fans → iDRAC auto (a shrink is accepted only when the next scan agrees) |
+| a hand-back to the iDRAC fails | re-sent every cycle until it succeeds |
+| CPU ≥ `CPU_LIMIT` in any mode (incl. `fixed`) | duty ≥ `EMERGENCY_PCT` |
 | duty or power cap computes to NaN/Inf | fans → iDRAC auto |
-| invalid settings (e.g. `INTERVAL` > 20 s, `FAN_MAX` > 100, limits out of order) | refuses to start; fans stay with the iDRAC |
+| invalid settings (e.g. `INTERVAL` > 10 s, `FAN_MAX` > 100, limits out of order, non-finite model values) | refuses to start; fans stay with the iDRAC |
 | a known drive stops reporting, drive data stale | fans → iDRAC auto |
 | panic in a control cycle (bug, unexpected BMC reply) | recovered: fans → iDRAC auto, next cycle retries |
 | panic in the drive reader | recovered and restarted; stale drive data → iDRAC auto meanwhile |
 | CPU ≥ `CPU_AUTO`, drive ≥ `HDD_AUTO`, exhaust ≥ `EXHAUST_AUTO` | fans → iDRAC auto |
 | fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` (retries for up to 12 s), restart after 5 s |
-| control loop hangs | systemd `WatchdogSec=30` kills it → `ExecStopPost` → restart |
+| control loop hangs | systemd `WatchdogSec=60` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |
 | iDRAC reset | fanctl re-sends its duty every `REASSERT` s and takes the fans back |
@@ -119,6 +124,7 @@ sudo systemctl daemon-reexec
 fanctl [run]   control loop (settings from the environment / /etc/fanctl.env)
 fanctl auto    hand the fans back to the iDRAC and exit
 fanctl probe   print every reading fanctl uses; changes nothing
+fanctl prepare create /dev/megaraid_sas_ioctl_node if missing (the driver doesn't; the unit runs this)
 ```
 
 Runtime mode switch, when `CONTROL_TOKEN` is set:
@@ -145,8 +151,11 @@ annotated defaults. The main ones:
 | `CPU_CURVE`, `HDD_CURVE`, `EXHAUST_CURVE` | | `temp:duty,...` |
 | `CPU_AUTO`, `HDD_AUTO`, `EXHAUST_AUTO` | `85`, `50`, `50` | hand over to the iDRAC at/above |
 | `CPU1_MODEL`, `CPU2_MODEL` | fitted | `pb,r0,k,n,scale` |
+| `REQUIRED_TEMPS` | `CPU1,Inlet,Exhaust` | must read every cycle |
+| `HDD_MIN` | `0` | drives that must be visible |
+| `FAN_MIN_RPM` | `1000` | dead/stalled fan threshold |
 | `FAN_RPM_TABLE` | `10:3270,...,30:6430` | measured RPM at fixed duty |
-| `INTERVAL` / `HDD_INTERVAL` / `HDD_RESCAN` | `10` / `300` / `600` | seconds |
+| `INTERVAL` / `HDD_INTERVAL` / `HDD_RESCAN` | `10` / `300` / `600` | seconds (`INTERVAL` ≤ 10) |
 | `REASSERT` | `60` | re-send the duty this often (s) |
 | `LISTEN` | `127.0.0.1:9101` | comma-separated listen addresses |
 | `CONTROL_TOKEN` | empty | enables `/control` |

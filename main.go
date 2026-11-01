@@ -14,6 +14,7 @@
 //	fanctl [run]   control loop (reads its settings from the environment)
 //	fanctl auto    hand the fans back to the iDRAC and exit
 //	fanctl probe   print every reading fanctl uses; changes nothing
+//	fanctl prepare create the PERC ioctl node if missing (run as root before the service)
 package main
 
 import (
@@ -43,6 +44,9 @@ type cpuModel struct{ pb, r0, k, n, scale float64 }
 
 var (
 	mode0, controlToken, listen                            string
+	requiredTemps                                          []string
+	hddMin                                                 int
+	fanMinRPM                                              float64
 	fixedPct0                                              int
 	minPct, cpuTarget, modelMargin, cpuLimit, emergencyPct float64
 	fanMax, pcapMin, pcapMax, pcapStep, kw, ki, iMax       float64
@@ -144,6 +148,14 @@ func loadConfig() {
 	reassert = envSeconds("REASSERT", "60")     // re-send the duty this often
 	listen = env("LISTEN", "127.0.0.1:9101")    // comma-separated
 	controlToken = env("CONTROL_TOKEN", "")     // empty = /control disabled
+	// temperatures that must read every cycle (a missing one never counts as "cool")
+	for _, t := range strings.Split(env("REQUIRED_TEMPS", "CPU1,Inlet,Exhaust"), ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			requiredTemps = append(requiredTemps, t)
+		}
+	}
+	hddMin = int(envFloat("HDD_MIN", "0"))      // fewer drives seen -> iDRAC
+	fanMinRPM = envFloat("FAN_MIN_RPM", "1000") // a fan below this (dead/stalled) -> iDRAC
 	switch mode0 {
 	case "curve", "model", "fixed", "auto":
 	default:
@@ -160,8 +172,18 @@ func validateConfig() {
 			log.Fatalf("config: "+f, a...)
 		}
 	}
+	fin := func(v ...float64) bool {
+		for _, x := range v {
+			if math.IsNaN(x) || math.IsInf(x, 0) {
+				return false
+			}
+		}
+		return true
+	}
 	pct := func(v float64) bool { return v >= 0 && v <= 100 }
-	check(interval >= time.Second && interval <= 20*time.Second, "INTERVAL must be 1-20 s (the systemd watchdog is 30 s)")
+	check(fin(minPct, cpuTarget, modelMargin, cpuLimit, emergencyPct, fanMax, pcapMin, pcapMax, pcapStep, kw, ki, iMax,
+		cpuAuto, hddAuto, exhaustAuto, fanMinRPM), "settings must be finite numbers")
+	check(interval >= time.Second && interval <= 10*time.Second, "INTERVAL must be 1-10 s (the systemd watchdog is 60 s)")
 	check(hddInterval >= 10*time.Second && hddRescan >= hddInterval, "need HDD_INTERVAL >= 10 s and HDD_RESCAN >= HDD_INTERVAL")
 	check(reassert >= interval, "REASSERT must be >= INTERVAL")
 	check(minPct >= 1 && minPct <= 100, "MIN_PCT must be 1-100")
@@ -171,19 +193,22 @@ func validateConfig() {
 	check(cpuTarget-modelMargin > 20 && cpuTarget < cpuLimit && cpuLimit < cpuAuto && cpuAuto <= 100,
 		"need 20 < CPU_TARGET-MODEL_MARGIN, CPU_TARGET < CPU_LIMIT < CPU_AUTO <= 100")
 	check(hddAuto > 0 && hddAuto <= 70 && exhaustAuto > 0 && exhaustAuto <= 80, "HDD_AUTO must be <= 70, EXHAUST_AUTO <= 80")
-	check(pcapMin >= 100 && pcapMin < pcapMax && pcapStep > 0, "need 100 <= PCAP_MIN < PCAP_MAX and PCAP_STEP > 0")
+	check(pcapMin >= 100 && pcapMin < pcapMax && pcapMax <= 2000 && pcapMax == math.Trunc(pcapMax) && pcapStep > 0,
+		"need 100 <= PCAP_MIN < PCAP_MAX <= 2000, PCAP_MAX a whole number, PCAP_STEP > 0")
+	check(hddMin >= 0 && fanMinRPM >= 0, "HDD_MIN and FAN_MIN_RPM must be >= 0")
 	check(ki >= 0 && iMax >= 0 && kw >= 0, "MODEL_KI, MODEL_I_MAX, PCAP_KW must be >= 0")
 	for name, c := range map[string]curve{"CPU_CURVE": cpuCurve, "HDD_CURVE": hddCurve, "EXHAUST_CURVE": exhaustCurve, "WARM_CURVE": warmCurve} {
 		for _, p := range c {
-			check(pct(p.y), "%s: duty %g outside 0-100", name, p.y)
+			check(fin(p.x) && pct(p.y), "%s: bad point %g:%g (duty must be 0-100)", name, p.x, p.y)
 		}
 	}
 	for i, p := range fanRPMTab {
-		check(pct(p.x) && p.y > 0 && (i == 0 || (p.x > fanRPMTab[i-1].x && p.y > fanRPMTab[i-1].y)),
+		check(pct(p.x) && fin(p.y) && p.y > 0 && (i == 0 || (p.x > fanRPMTab[i-1].x && p.y > fanRPMTab[i-1].y)),
 			"FAN_RPM_TABLE must rise in both duty and rpm")
 	}
 	for i, m := range cpuModels {
-		check(m.pb >= 0 && m.r0 >= 0 && m.k > 0 && m.n > 0 && m.scale > 0, "CPU%d_MODEL: need pb,r0 >= 0 and k,n,scale > 0", i+1)
+		check(fin(m.pb, m.r0, m.k, m.n, m.scale) && m.pb >= 0 && m.pb < 1000 && m.r0 >= 0 && m.k > 0 && m.n > 0 && m.n < 10 && m.scale > 0,
+			"CPU%d_MODEL: need finite pb (0-1000), r0 >= 0, k > 0, n (0-10), scale > 0", i+1)
 	}
 }
 
@@ -381,21 +406,21 @@ func readInt(p string) (int64, error) {
 // ---------- control loop ----------
 
 type controller struct {
-	bmc     *BMC
-	sensors []Sensor
-	expect  map[string]bool // temperature sensors seen on the first good read
-	kick    chan struct{}   // ask the drive goroutine for an early re-read
+	bmc      *BMC
+	sensors  []Sensor
+	expect   map[string]bool // temperature sensors seen on the first good read
+	fansSeen map[string]bool // fans seen on the first good read
+	kick     chan struct{}   // ask the drive goroutine for an early re-read
 
-	current             float64 // last duty sent; valid when manual
-	manual              bool
-	sentAt              time.Time
-	modelI, capCorr     float64
-	lastCap             float64 // valid when capSet
-	capSet              bool
-	hotHist             []float64 // hottest CPU, last 60 s
-	raplOff             float64   // learned wall - RAPL offset (W); valid when raplLearned
-	raplLearned         bool
-	modelPart, warmPart float64
+	current         float64 // last duty sent; valid when manual
+	manual          bool
+	sentAt          time.Time
+	modelI, capCorr float64
+	lastCap         float64 // valid when capSet
+	capSet          bool
+	hotHist         []float64 // hottest CPU, last 60 s
+	raplOff         float64   // learned wall - RAPL offset (W); valid when raplLearned
+	raplLearned     bool
 }
 
 func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, err error) {
@@ -449,6 +474,23 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 			return nil, nil, 0, fmt.Errorf("temperature %s stopped reporting", k)
 		}
 	}
+	for _, k := range requiredTemps {
+		if _, ok := temps[k]; !ok {
+			return nil, nil, 0, fmt.Errorf("required temperature %s has no reading", k)
+		}
+	}
+	// a dead, stalled or vanished fan: the iDRAC compensates with the others, we can't
+	if c.fansSeen == nil {
+		c.fansSeen = map[string]bool{}
+		for k := range fans {
+			c.fansSeen[k] = true
+		}
+	}
+	for k := range c.fansSeen {
+		if v, ok := fans[k]; !ok || v < fanMinRPM {
+			return nil, nil, 0, fmt.Errorf("fan %s at %g rpm (missing or below FAN_MIN_RPM)", k, v)
+		}
+	}
 	for k, v := range temps {
 		if !(v > 0 && v < 127) {
 			return nil, nil, 0, fmt.Errorf("implausible %s reading %g C", k, v)
@@ -460,7 +502,10 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 func (c *controller) setAuto(why string) error {
 	err := c.bmc.FanAuto()
 	st.Lock()
-	st.auto, st.duty, st.reason = 1, -1, why
+	if err == nil {
+		st.auto, st.duty = 1, -1
+	}
+	st.reason = why
 	st.Unlock()
 	return err
 }
@@ -488,11 +533,20 @@ func (c *controller) step() error {
 	hdds.Unlock()
 	st.Lock()
 	st.temps, st.fans, st.hdd, st.watts, st.lastOK = temps, fans, hdd, watts, float64(time.Now().UnixMilli())/1000
-	mode, fixedPct, reason := st.mode, st.fixed, st.reason
+	mode, fixedPct, reason, capNow := st.mode, st.fixed, st.reason, st.powerCap
 	st.Unlock()
 
 	if mode != "model" {
 		c.capSet = false
+		if capNow != 0 && capNow != int(pcapMax) { // left model mode: don't leave our cap behind
+			if err := c.bmc.SetPowerCap(int(pcapMax)); err != nil {
+				return err
+			}
+			st.Lock()
+			st.powerCap = int(pcapMax)
+			st.Unlock()
+			log.Printf("power cap lifted (%d W, mode=%s)", int(pcapMax), mode)
+		}
 	}
 	var r decision
 	ivl := interval.Seconds()
@@ -501,8 +555,10 @@ func (c *controller) step() error {
 		r.why = "mode=auto"
 	case !scanned:
 		r.why = "scanning drives"
+	case len(ids) < hddMin:
+		r.why = fmt.Sprintf("only %d drives found (HDD_MIN %d)", len(ids), hddMin)
 	case time.Since(hddAt) > hddInterval+2*time.Minute:
-		r.why = fmt.Sprintf("hdd temps stale (%.0fs old)", time.Since(hddAt).Seconds())
+		r.why = "hdd temps stale"
 	case len(hdd) < len(ids): // can't see every drive -> don't guess
 		r.why = fmt.Sprintf("hdd temps missing (%d/%d)", len(hdd), len(ids))
 		select {
@@ -530,9 +586,6 @@ func (c *controller) step() error {
 			ff = math.Max(watts, pr+c.raplOff)
 		}
 		r = decide(temps, hdd, ff, true, c.modelI)
-		if r.modelRan {
-			c.modelPart, c.warmPart = r.modelPart, r.warmPart
-		}
 		st.Lock()
 		st.ffWatts = ff
 		st.Unlock()
@@ -595,7 +648,7 @@ func (c *controller) step() error {
 			}
 			settled := float64(len(c.hotHist)) > 60/ivl && hi-lo <= 1
 			// ... and only while the model's own request (not the warm floor) sets the CPU demand
-			onCPU := !emergency && c.modelPart >= c.warmPart && math.Abs(r.target-cpuEff) < 0.5 &&
+			onCPU := !emergency && r.modelRan && r.modelPart >= r.warmPart && math.Abs(r.target-cpuEff) < 0.5 &&
 				cpuEff >= math.Max(d.hdd, d.exhaust)
 			if settled && onCPU && math.Abs(over) < 5 && !(d.cpu <= minPct && over < 0) && !(pinned && over > 0) {
 				c.modelI = math.Max(-iMax, math.Min(iMax, c.modelI+ki*over*ivl/60))
@@ -610,6 +663,9 @@ func (c *controller) step() error {
 			r.target = math.Max(r.target, c.current-2)
 		}
 	}
+	if hot := hottestCPU(temps); r.ok && hot >= cpuLimit && r.target < emergencyPct { // every mode, incl. fixed
+		r.target, r.why = emergencyPct, fmt.Sprintf("cpu %.0fC >= limit %.0f", hot, cpuLimit)
+	}
 	if r.ok || r.d != (demand{}) {
 		st.Lock()
 		st.demand, st.hasDemand = r.d, true
@@ -617,22 +673,21 @@ func (c *controller) step() error {
 	}
 
 	if !r.ok {
-		if c.manual || reason == "start" {
-			if err := c.setAuto(r.why); err != nil {
-				return err
-			}
+		// sent every cycle, not only on the transition: an earlier hand-back may have failed and left
+		// the BMC in manual at a low duty
+		if err := c.setAuto(r.why); err != nil {
+			return err
+		}
+		if c.manual || reason != r.why {
 			log.Printf("auto: %s", r.why)
 		}
-		c.manual = false
-		st.Lock()
-		st.reason = r.why
-		st.Unlock()
+		c.manual, c.hotHist = false, nil
 	} else if !c.manual || math.Round(r.target) != math.Round(c.current) || time.Since(c.sentAt) >= reassert {
 		// re-sent periodically: retakes the fans after an iDRAC reset
 		if math.IsNaN(r.target) || math.IsInf(r.target, 0) { // int(NaN) is undefined: could mean 0 %
 			return fmt.Errorf("duty computed as %v", r.target)
 		}
-		pct := max(0, min(100, int(r.target)))
+		pct := max(0, min(100, int(math.Round(r.target))))
 		if err := c.bmc.FanDuty(pct); err != nil {
 			return err
 		}
@@ -681,8 +736,17 @@ func (c *controller) run() {
 
 // hddWorker runs hddLoop and restarts it after a panic; meanwhile the drive data goes stale and
 // the control loop hands the fans to the iDRAC.
-func hddWorker(p *Perc, kick <-chan struct{}) {
+func hddWorker(kick <-chan struct{}) {
 	for {
+		p, err := OpenPerc()
+		if err != nil { // no controller (yet): publish "no drives" (HDD_MIN decides) and retry
+			log.Printf("drives: %v (retrying in 60 s)", err)
+			hdds.Lock()
+			hdds.ids, hdds.temps, hdds.at, hdds.scanned = nil, map[Drive]float64{}, time.Now(), true
+			hdds.Unlock()
+			time.Sleep(time.Minute)
+			continue
+		}
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -699,15 +763,26 @@ func hddWorker(p *Perc, kick <-chan struct{}) {
 func hddLoop(p *Perc, kick <-chan struct{}) {
 	var ids []Drive
 	var scanAt time.Time
+	shrink := false
 	for {
-		if p != nil && time.Since(scanAt) >= hddRescan {
+		if time.Since(scanAt) >= hddRescan {
 			found := p.Scan()
-			if scanAt.IsZero() {
+			switch {
+			case scanAt.IsZero():
 				log.Printf("drives: %v", found)
-			} else if fmt.Sprint(found) != fmt.Sprint(ids) {
+				ids = found
+			case fmt.Sprint(found) == fmt.Sprint(ids):
+				shrink = false
+			case len(found) < len(ids) && !shrink:
+				// a drive missing from one scan may be a controller hiccup: keep expecting it (its
+				// missing temperature keeps the iDRAC in charge) until the next scan agrees
+				log.Printf("drives missing from scan: %v -> %v (confirming on the next scan)", ids, found)
+				shrink = true
+			default:
 				log.Printf("drives changed: %v -> %v", ids, found)
+				ids, shrink = found, false
 			}
-			ids, scanAt = found, time.Now()
+			scanAt = time.Now()
 		}
 		temps := map[Drive]float64{}
 		for _, d := range ids {
@@ -744,6 +819,10 @@ func sdNotify(msg string) {
 
 func num(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
+var labelEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
+func lbl(s string) string { return labelEscaper.Replace(s) } // Prometheus label value escaping
+
 func metrics(w http.ResponseWriter, _ *http.Request) {
 	st.Lock()
 	defer st.Unlock()
@@ -759,15 +838,15 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	line("# TYPE fanctl_temperature_celsius gauge")
 	for _, k := range sorted(st.temps) {
-		line(`fanctl_temperature_celsius{sensor="%s"} %s`, k, num(st.temps[k]))
+		line(`fanctl_temperature_celsius{sensor="%s"} %s`, lbl(k), num(st.temps[k]))
 	}
 	line("# TYPE fanctl_fan_rpm gauge")
 	for _, k := range sorted(st.fans) {
-		line(`fanctl_fan_rpm{fan="%s"} %s`, k, num(st.fans[k]))
+		line(`fanctl_fan_rpm{fan="%s"} %s`, lbl(k), num(st.fans[k]))
 	}
 	line("# TYPE fanctl_hdd_temperature_celsius gauge")
 	for d, v := range st.hdd {
-		line(`fanctl_hdd_temperature_celsius{id="%d",serial="%s"} %s`, d.ID, d.Serial, num(v))
+		line(`fanctl_hdd_temperature_celsius{id="%d",serial="%s"} %s`, d.ID, lbl(d.Serial), num(v))
 	}
 	if st.powerCap > 0 {
 		line("# TYPE fanctl_power_cap_watts gauge\nfanctl_power_cap_watts %d", st.powerCap)
@@ -793,7 +872,7 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 	line("# TYPE fanctl_auto_mode gauge\nfanctl_auto_mode %d", st.auto)
 	line("# TYPE fanctl_errors_total counter\nfanctl_errors_total %d", st.errors)
 	line("# TYPE fanctl_last_read_timestamp_seconds gauge\nfanctl_last_read_timestamp_seconds %.3f", st.lastOK)
-	line(`fanctl_info{mode="%s",reason="%s"} 1`, st.mode, strings.ReplaceAll(st.reason, `"`, `'`))
+	line(`fanctl_info{mode="%s",reason="%s"} 1`, lbl(st.mode), lbl(st.reason))
 	line("# TYPE fanctl_fixed_percent gauge\nfanctl_fixed_percent %d", st.fixed)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	_, _ = w.Write([]byte(b.String()))
@@ -857,6 +936,10 @@ func fansToIDRAC(bmc *BMC) error {
 
 func cmdAuto() {
 	bmc, err := OpenBMC()
+	for deadline := time.Now().Add(30 * time.Second); err != nil && time.Now().Before(deadline); { // early boot
+		time.Sleep(time.Second)
+		bmc, err = OpenBMC()
+	}
 	if err == nil {
 		err = fansToIDRAC(bmc)
 	}
@@ -864,6 +947,34 @@ func cmdAuto() {
 		log.Fatalf("fans -> iDRAC auto: %v", err)
 	}
 	log.Print("fans -> iDRAC automatic control")
+}
+
+// cmdPrepare creates /dev/megaraid_sas_ioctl_node: the megaraid_sas driver registers the char
+// device but never creates the node (smartctl and storcli mknod it themselves). Runs as root
+// before the sandboxed service (ExecStartPre=+).
+func cmdPrepare() {
+	const node = "/dev/megaraid_sas_ioctl_node"
+	if _, err := os.Stat(node); err == nil {
+		return
+	}
+	b, err := os.ReadFile("/proc/devices")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[1] == "megaraid_sas_ioctl" {
+			major, err := strconv.Atoi(f[0])
+			if err == nil {
+				err = syscall.Mknod(node, syscall.S_IFCHR|0o600, major<<8)
+			}
+			if err != nil {
+				log.Fatalf("create %s: %v", node, err)
+			}
+			log.Printf("created %s (major %d)", node, major)
+			return
+		}
+	}
+	log.Print("no megaraid_sas controller: no drive temperatures")
 }
 
 func cmdProbe() {
@@ -923,9 +1034,12 @@ func main() {
 	case "probe":
 		cmdProbe()
 		return
+	case "prepare":
+		cmdPrepare()
+		return
 	case "run":
 	default:
-		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe]")
+		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe|prepare]")
 		os.Exit(2)
 	}
 
@@ -941,7 +1055,9 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sig
-		if err := fansToIDRAC(bmc); err != nil {
+		err := fansToIDRAC(bmc)
+		bmc.mu.Lock() // held until exit: the control loop can't send another duty after the hand-back
+		if err != nil {
 			log.Printf("shutdown: fans -> iDRAC auto failed: %v", err)
 			os.Exit(1)
 		}
@@ -949,11 +1065,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	perc, err := OpenPerc()
-	if err != nil {
-		log.Printf("drives: %v (running without drive temperatures)", err)
-	}
-	go hddWorker(perc, c.kick)
+	go hddWorker(c.kick)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", metrics)

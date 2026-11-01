@@ -209,8 +209,8 @@ func (b *BMC) GetPowerLimit() (PowerLimit, error) {
 	return PowerLimit{Active: cc == 0, Watts: int(d[4]) | int(d[5])<<8, raw: d}, nil
 }
 
-// SetPowerCap sets and activates the limit, keeping the exception action, correction time and
-// sampling period the iDRAC already has, then reads it back. Never 'deactivate': on iDRAC8 a later
+// SetPowerCap sets and activates the limit, keeping the correction time and sampling period the
+// iDRAC already has (exception action forced to "no action", never hard power-off), then reads it back. Never 'deactivate': on iDRAC8 a later
 // activate silently fails, so "no cap" is a high limit instead.
 func (b *BMC) SetPowerCap(watts int) error {
 	cur, err := b.GetPowerLimit()
@@ -218,7 +218,7 @@ func (b *BMC) SetPowerCap(watts int) error {
 		return err
 	}
 	r := cur.raw
-	if _, err := b.Cmd(0x2c, 0x04, 0xdc, 0, 0, 0, r[3], byte(watts), byte(watts>>8),
+	if _, err := b.Cmd(0x2c, 0x04, 0xdc, 0, 0, 0, 0x00, byte(watts), byte(watts>>8),
 		r[6], r[7], r[8], r[9], 0, 0, r[12], r[13]); err != nil {
 		return fmt.Errorf("dcmi set power limit %d W: %w", watts, err)
 	}
@@ -299,6 +299,9 @@ func (b *BMC) getSDR(resv *uint16, id uint16) ([]byte, uint16, error) {
 		return nil, 0, fmt.Errorf("get SDR %04x: short header", id)
 	}
 	rec, total := append([]byte(nil), hdr...), 5+int(hdr[4])
+	if total > 255 { // offsets are one byte; real records are <= 64
+		return nil, 0, fmt.Errorf("get SDR %04x: record length %d", id, total)
+	}
 	for len(rec) < total {
 		part, _, err := read(byte(len(rec)), byte(min(16, total-len(rec))))
 		if err != nil {

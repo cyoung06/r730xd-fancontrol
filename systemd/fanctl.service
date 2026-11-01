@@ -5,12 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-EnvironmentFile=/etc/fanctl.env
+# '-': a missing file must not also block ExecStopPost (the hand-back)
+EnvironmentFile=-/etc/fanctl.env
+# create the PERC ioctl node (the driver doesn't), outside the sandbox
+ExecStartPre=-+/usr/local/bin/fanctl prepare
 ExecStart=/usr/local/bin/fanctl
 # runs after every stop, crash or watchdog kill: fans back to the iDRAC
 ExecStopPost=/usr/local/bin/fanctl auto
-# the control loop pings every INTERVAL; silent for 30 s -> killed and restarted
-WatchdogSec=30
+# the control loop pings every INTERVAL (<= 10 s); silent for 60 s -> killed and restarted
+WatchdogSec=60
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
@@ -19,7 +22,7 @@ NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SYS_ADMIN
 DevicePolicy=closed
 DeviceAllow=/dev/ipmi0 rw
-DeviceAllow=/dev/megaraid_sas_ioctl_node rw
+DeviceAllow=char-megaraid_sas_ioctl rw
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
