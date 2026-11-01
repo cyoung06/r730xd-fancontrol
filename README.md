@@ -61,8 +61,10 @@ in control:
 |---|---|
 | sensor read fails, BMC times out | fans → iDRAC auto, retried next cycle |
 | a known drive stops reporting, drive data stale | fans → iDRAC auto |
+| panic in a control cycle (bug, unexpected BMC reply) | recovered: fans → iDRAC auto, next cycle retries |
+| panic in the drive reader | recovered and restarted; stale drive data → iDRAC auto meanwhile |
 | CPU ≥ `CPU_AUTO`, drive ≥ `HDD_AUTO`, exhaust ≥ `EXHAUST_AUTO` | fans → iDRAC auto |
-| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` |
+| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` (retries for up to 12 s), restart after 5 s |
 | control loop hangs | systemd `WatchdogSec=30` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |

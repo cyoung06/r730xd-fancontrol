@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -585,10 +586,21 @@ func (c *controller) step() error {
 	return nil
 }
 
+// safeStep runs one cycle; a panic (a bug, a reply the parsers didn't expect) counts as a failed
+// cycle like any other error instead of killing the process.
+func (c *controller) safeStep() (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+		}
+	}()
+	return c.step()
+}
+
 func (c *controller) run() {
 	sdNotify("READY=1")
 	for {
-		if err := c.step(); err != nil { // any failure -> safe mode
+		if err := c.safeStep(); err != nil { // any failure -> safe mode
 			st.Lock()
 			st.errors++
 			st.Unlock()
@@ -597,6 +609,22 @@ func (c *controller) run() {
 			c.manual = false
 		}
 		sdNotify("WATCHDOG=1")
+		time.Sleep(interval)
+	}
+}
+
+// hddWorker runs hddLoop and restarts it after a panic; meanwhile the drive data goes stale and
+// the control loop hands the fans to the iDRAC.
+func hddWorker(p *Perc, kick <-chan struct{}) {
+	for {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("drive reader panic: %v\n%s", r, debug.Stack())
+				}
+			}()
+			hddLoop(p, kick)
+		}()
 		time.Sleep(interval)
 	}
 }
@@ -745,10 +773,24 @@ func serve(addr string, h http.Handler) {
 
 // ---------- subcommands ----------
 
+// fansToIDRAC hands the fans back, retrying through a busy or briefly unresponsive BMC. Bounded so
+// it finishes within systemd's TimeoutStopSec (20 s) even when every attempt times out (5 s).
+func fansToIDRAC(bmc *BMC) error {
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		err := bmc.FanAuto()
+		if err == nil || time.Now().After(deadline) {
+			return err
+		}
+		log.Printf("fans -> iDRAC auto: %v (retrying)", err)
+		time.Sleep(time.Second)
+	}
+}
+
 func cmdAuto() {
 	bmc, err := OpenBMC()
 	if err == nil {
-		err = bmc.FanAuto()
+		err = fansToIDRAC(bmc)
 	}
 	if err != nil {
 		log.Fatalf("fans -> iDRAC auto: %v", err)
@@ -831,7 +873,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sig
-		if err := bmc.FanAuto(); err != nil {
+		if err := fansToIDRAC(bmc); err != nil {
 			log.Printf("shutdown: fans -> iDRAC auto failed: %v", err)
 			os.Exit(1)
 		}
@@ -843,7 +885,7 @@ func main() {
 	if err != nil {
 		log.Printf("drives: %v (running without drive temperatures)", err)
 	}
-	go hddLoop(perc, c.kick)
+	go hddWorker(perc, c.kick)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", metrics)
