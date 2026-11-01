@@ -1,7 +1,7 @@
 [Unit]
 Description=R730xd fan controller (model-based fan duty + iDRAC power cap)
-After=fanctl-failsafe.service network-online.target
-Wants=network-online.target
+# no other dependencies: it must run whatever else is up (the HTTP listener retries by itself)
+After=fanctl-failsafe.service
 
 [Service]
 Type=notify
