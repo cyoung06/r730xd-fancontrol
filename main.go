@@ -54,6 +54,8 @@ var (
 	interval, hddInterval, hddRescan, reassert             time.Duration
 	cpuCurve, hddCurve, exhaustCurve, warmCurve, fanRPMTab curve
 	cpuModels                                              []cpuModel
+	exhaustModel                                           []float64 // a, b (EXHAUST_MODEL)
+	exhaustExcessCurve                                     curve
 )
 
 func env(k, def string) string {
@@ -117,6 +119,20 @@ func loadConfig() {
 	cpuCurve = envCurve("CPU_CURVE", "55:10,62:15,68:25,74:40,80:60", 1)
 	hddCurve = envCurve("HDD_CURVE", "38:10,41:20,44:35,47:50", 1)
 	exhaustCurve = envCurve("EXHAUST_CURVE", "38:10,42:25,46:45", 1)
+	// The exhaust demand reacts only to heat the sensors don't explain (PERC, RAM, PCIe, a blocked vent).
+	// Expected exhaust, fitted on steady history (fit 2026-11-08 over 2026-10-31..11-08, rmse 1.2 C; airflow
+	// cancels out: faster fans take more heat off a part but spread it through proportionally more air):
+	//   T_exh = T_inlet + a * (T_cpu - T_inlet) + b * (T_hdd - T_inlet)    (hottest CPU, hottest drive)
+	// EXHAUST_EXCESS_CURVE maps the excess (measured - expected, C) to a duty. EXHAUST_AUTO still applies to
+	// the absolute exhaust, and a cycle without a drive reading falls back to the absolute EXHAUST_CURVE.
+	for _, f := range strings.Split(env("EXHAUST_MODEL", "0.3716,0.1911"), ",") {
+		x, err := strconv.ParseFloat(strings.TrimSpace(f), 64)
+		if err != nil {
+			log.Fatalf("EXHAUST_MODEL: %v", err)
+		}
+		exhaustModel = append(exhaustModel, x)
+	}
+	exhaustExcessCurve = envCurve("EXHAUST_EXCESS_CURVE", "3:10,5:20,7:40", 1)
 	// MODE=model: lowest duty that keeps the hottest CPU at CPU_TARGET, from the fitted steady-state model
 	//   T_cpu = T_inlet + (P - pb) * (r0 + k * (rpm/1000)^-n) * scale      (P = iDRAC wall power)
 	// plus a slow integral correction on the measured temperature (model error, dust, layout, room).
@@ -197,7 +213,9 @@ func validateConfig() {
 		"need 100 <= PCAP_MIN < PCAP_MAX <= 2000, PCAP_MAX a whole number, PCAP_STEP > 0")
 	check(hddMin >= 0 && fanMinRPM >= 0, "HDD_MIN and FAN_MIN_RPM must be >= 0")
 	check(ki >= 0 && iMax >= 0 && kw >= 0, "MODEL_KI, MODEL_I_MAX, PCAP_KW must be >= 0")
-	for name, c := range map[string]curve{"CPU_CURVE": cpuCurve, "HDD_CURVE": hddCurve, "EXHAUST_CURVE": exhaustCurve, "WARM_CURVE": warmCurve} {
+	check(len(exhaustModel) == 2 && fin(exhaustModel...) && exhaustModel[0] >= 0 && exhaustModel[1] >= 0 && exhaustModel[0]+exhaustModel[1] < 1,
+		"EXHAUST_MODEL: need a,b >= 0 with a+b < 1 (the exhaust is a mix of inlet air and air warmed by the parts)")
+	for name, c := range map[string]curve{"CPU_CURVE": cpuCurve, "HDD_CURVE": hddCurve, "EXHAUST_CURVE": exhaustCurve, "WARM_CURVE": warmCurve, "EXHAUST_EXCESS_CURVE": exhaustExcessCurve} {
 		for _, p := range c {
 			check(fin(p.x) && pct(p.y), "%s: bad point %g:%g (duty must be 0-100)", name, p.x, p.y)
 		}
@@ -230,6 +248,7 @@ var st = struct {
 	modelI             float64
 	modelOn, hasDemand bool
 	demand             demand
+	exhExpected        float64 // 0 = not computed (no model or no drive temperature)
 }{duty: -1, auto: 1, reason: "start"}
 
 // drive temperatures, refreshed by their own goroutine so a slow or hung drive never stalls the loop
@@ -323,6 +342,7 @@ type decision struct {
 	d                   demand
 	modelPart, warmPart float64
 	modelRan            bool
+	exhExpected         float64 // EXHAUST_MODEL's expected exhaust, 0 = not used this cycle
 }
 
 func decide(temps map[string]float64, hdd map[Drive]float64, watts float64, model bool, modelI float64) decision {
@@ -337,6 +357,11 @@ func decide(temps map[string]float64, hdd map[Drive]float64, watts float64, mode
 		cpuDemand = math.Max(r.modelPart, r.warmPart)
 	}
 	r.d = demand{cpu: math.Max(minPct, cpuDemand), hdd: interp(hddCurve, disk), exhaust: interp(exhaustCurve, exhaust)}
+	if disk > 0 { // without a drive reading: the absolute curve
+		in := inletOf(temps)
+		r.exhExpected = in + exhaustModel[0]*(cpu-in) + exhaustModel[1]*(disk-in)
+		r.d.exhaust = interp(exhaustExcessCurve, exhaust-r.exhExpected)
+	}
 	switch {
 	case cpu >= cpuAuto:
 		r.why = fmt.Sprintf("cpu %.0fC >= %.0f", cpu, cpuAuto)
@@ -668,7 +693,7 @@ func (c *controller) step() error {
 	}
 	if r.ok || r.d != (demand{}) {
 		st.Lock()
-		st.demand, st.hasDemand = r.d, true
+		st.demand, st.hasDemand, st.exhExpected = r.d, true, r.exhExpected
 		st.Unlock()
 	}
 
@@ -864,6 +889,12 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 		line(`fanctl_demand_percent{source="cpu"} %.1f`, st.demand.cpu)
 		line(`fanctl_demand_percent{source="hdd"} %.1f`, st.demand.hdd)
 		line(`fanctl_demand_percent{source="exhaust"} %.1f`, st.demand.exhaust)
+	}
+	if st.exhExpected > 0 {
+		line("# TYPE fanctl_exhaust_expected_celsius gauge\nfanctl_exhaust_expected_celsius %.2f", st.exhExpected)
+		if v, ok := st.temps["Exhaust"]; ok {
+			line("# TYPE fanctl_exhaust_excess_celsius gauge\nfanctl_exhaust_excess_celsius %.2f", v-st.exhExpected)
+		}
 	}
 	if st.watts > 0 {
 		line("# TYPE fanctl_power_watts gauge\nfanctl_power_watts %s", num(st.watts))

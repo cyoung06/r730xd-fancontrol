@@ -23,6 +23,24 @@ Modes (`MODE`):
 | `fixed` | `FIXED_PCT` (the safety limits still apply) |
 | `auto`  | iDRAC automatic control |
 
+### The exhaust model (all modes with drive readings)
+
+The exhaust stands in for parts without a temperature sensor (PERC, RAM, PCIe cards). Most of its heat
+comes from the CPUs and drives, which have their own control, so fanctl compares the exhaust against what
+those explain:
+
+```
+T_exh_expected = T_inlet + a * (T_cpu - T_inlet) + b * (T_hdd - T_inlet)      (hottest CPU, hottest drive)
+```
+
+The exhaust is a mix of inlet air and air warmed by each part, so `a, b >= 0` and `a + b < 1`, with no
+constant term. Fan speed drops out: faster fans take more heat off a part but spread it through
+proportionally more air. `EXHAUST_EXCESS_CURVE` turns the excess (measured minus expected) into a duty,
+so the exhaust only raises the fans for heat the sensors don't account for. `EXHAUST_AUTO` still applies
+to the absolute exhaust, and a cycle without a drive reading uses the absolute `EXHAUST_CURVE`. The
+default `a, b` (0.3716, 0.1911) were fitted on 8 days of steady data from my R730xd (rmse 1.2 C); refit
+for another machine.
+
 ### The thermal model (`MODE=model`)
 
 The steady-state CPU temperature is modelled per socket as
@@ -149,6 +167,8 @@ annotated defaults. The main ones:
 | `PCAP_MIN` / `PCAP_MAX` | `230` / `586` | power cap range (W); `PCAP_MAX` = "no cap" |
 | `WARM_CURVE` | `68:10,72:15,76:20` | model mode: duty floor vs hottest CPU |
 | `CPU_CURVE`, `HDD_CURVE`, `EXHAUST_CURVE` | | `temp:duty,...` |
+| `EXHAUST_MODEL` | `0.3716,0.1911` | `a,b` of the expected exhaust (above) |
+| `EXHAUST_EXCESS_CURVE` | `3:10,5:20,7:40` | `excess C:duty,...`; replaces `EXHAUST_CURVE` while drive temperatures are read |
 | `CPU_AUTO`, `HDD_AUTO`, `EXHAUST_AUTO` | `85`, `50`, `50` | hand over to the iDRAC at/above |
 | `CPU1_MODEL`, `CPU2_MODEL` | fitted | `pb,r0,k,n,scale` |
 | `REQUIRED_TEMPS` | `CPU1,Inlet,Exhaust` | must read every cycle |
