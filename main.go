@@ -126,6 +126,7 @@ func loadConfig() {
 	//   T_exh = T_inlet + a * (T_cpu - T_inlet) + b * (T_hdd - T_inlet)    (hottest CPU, hottest drive)
 	// EXHAUST_EXCESS_CURVE maps the excess (measured - expected, C) to a duty. EXHAUST_AUTO still applies to
 	// the absolute exhaust, and a cycle without a drive reading falls back to the absolute EXHAUST_CURVE.
+	exhaustModel = nil // loadConfig also runs on reload: rebuild, never append to the old values
 	for _, f := range strings.Split(env("EXHAUST_MODEL", "0.3716,0.1911"), ",") {
 		x, err := strconv.ParseFloat(strings.TrimSpace(f), 64)
 		if err != nil {
@@ -166,6 +167,7 @@ func loadConfig() {
 	listen = env("LISTEN", "127.0.0.1:9101")    // comma-separated
 	controlToken = env("CONTROL_TOKEN", "")     // empty = /control disabled
 	// temperatures that must read every cycle (a missing one never counts as "cool")
+	requiredTemps = nil
 	for _, t := range strings.Split(env("REQUIRED_TEMPS", "CPU1,Inlet,Exhaust"), ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			requiredTemps = append(requiredTemps, t)
