@@ -1049,7 +1049,19 @@ func fansToIDRAC(bmc *BMC) error {
 	}
 }
 
+// handoffFile, if fresh, tells the next "fanctl auto" (ExecStopPost) that a new fanctl is about to take over:
+// leave the fans at their duty instead of handing them to the iDRAC (the fans would spin up for a few
+// seconds). It's honoured once and only within handoffMaxAge, so a later crash still hands back.
+const handoffFile, handoffMaxAge = "/run/fanctl-handoff", time.Minute
+
 func cmdAuto() {
+	if fi, err := os.Stat(handoffFile); err == nil {
+		os.Remove(handoffFile)
+		if age := time.Since(fi.ModTime()); age >= 0 && age < handoffMaxAge {
+			log.Printf("%s is %.0fs old: leaving the fans for the restarting fanctl", handoffFile, age.Seconds())
+			return
+		}
+	}
 	bmc, err := OpenBMC()
 	for deadline := time.Now().Add(30 * time.Second); err != nil && time.Now().Before(deadline); { // early boot
 		time.Sleep(time.Second)
@@ -1170,6 +1182,29 @@ func main() {
 		log.Fatal(err)
 	}
 	c := &controller{bmc: bmc, kick: make(chan struct{}, 1), reload: make(chan func(), 1)}
+
+	// SIGUSR2 (systemctl kill -s USR2 fanctl): replace this process with the binary at the same path, e.g.
+	// after installing a new version. Same PID, never stopped, so the fans keep their duty and stay out of
+	// the iDRAC's hands; the new binary takes over on its first cycle.
+	usr2 := make(chan os.Signal, 1)
+	signal.Notify(usr2, syscall.SIGUSR2)
+	go func() {
+		for range usr2 {
+			self := os.Args[0]
+			if !strings.HasPrefix(self, "/") {
+				if p, err := os.Executable(); err == nil {
+					self = p
+				}
+			}
+			c.reload <- func() {
+				bmc.mu.Lock() // no duty is sent between here and the exec
+				log.Printf("re-exec %s", self)
+				err := syscall.Exec(self, os.Args, os.Environ())
+				bmc.mu.Unlock()
+				log.Printf("re-exec failed: %v (keeping this process)", err)
+			}
+		}
+	}()
 
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)

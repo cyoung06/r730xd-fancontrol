@@ -30,6 +30,12 @@ validate it in a subprocess, and swaps the settings in between two control cycle
 through the iDRAC. A refused file is logged and the running settings stay. `MODE`/`FIXED_PCT` from the file
 replace a choice made through `/control`; `LISTEN` and `CONTROL_TOKEN` still need a restart.
 
+New binary: install it over `/usr/local/bin/fanctl`, then `sudo systemctl kill -s USR2 fanctl`. fanctl
+re-execs itself in place (same PID), so the fans keep their duty instead of passing through the iDRAC.
+
+To restart anyway without the hand-back (e.g. from a version without USR2): `sudo touch /run/fanctl-handoff`
+within a minute before the stop makes the following `fanctl auto` leave the fans alone, once.
+
 ### The exhaust model (all modes with drive readings)
 
 The exhaust stands in for parts without a temperature sensor (PERC, RAM, PCIe cards). Most of its heat
