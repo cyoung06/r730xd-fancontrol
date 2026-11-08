@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime/debug"
 	"sort"
@@ -178,6 +179,82 @@ func loadConfig() {
 		log.Fatalf("MODE must be curve, model, fixed or auto")
 	}
 	validateConfig()
+}
+
+// ---------- reload (systemctl reload fanctl = SIGHUP) ----------
+//
+// systemd hands the settings over as environment variables (EnvironmentFile), read once at start. On a
+// reload fanctl reads the env file itself, has a "fanctl check" subprocess validate it (a bad value there
+// exits that process, not this one), and only then swaps the settings in between two control cycles, so
+// the fans never pass through the iDRAC. MODE/FIXED_PCT from the file replace a runtime /control choice.
+// LISTEN and CONTROL_TOKEN changes need a restart.
+
+func envFilePath() string { return env("FANCTL_ENV_FILE", "/etc/fanctl.env") }
+
+// readEnvFile parses KEY=VALUE lines like systemd's EnvironmentFile: blank lines and # or ; comments are
+// skipped, and one pair of surrounding quotes is removed.
+func readEnvFile(path string) (map[string]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	for _, l := range strings.Split(string(b), "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || l[0] == '#' || l[0] == ';' {
+			continue
+		}
+		k, v, ok := strings.Cut(l, "=")
+		if !ok {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		m[k] = v
+	}
+	return m, nil
+}
+
+var fileKeys map[string]string // what the env file held at the last (re)load
+
+// prepareReload reads and validates the env file; the returned func applies it (call between cycles).
+func prepareReload() (func(), error) {
+	m, err := readEnvFile(envFilePath())
+	if err != nil {
+		return nil, err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(self, "check")
+	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	for k, v := range m {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("%s refused: %s", envFilePath(), strings.TrimSpace(string(out)))
+	}
+	return func() {
+		oldListen, oldToken := listen, controlToken
+		for k := range fileKeys { // a line removed from the file falls back to its default
+			if _, still := m[k]; !still {
+				os.Unsetenv(k)
+			}
+		}
+		for k, v := range m {
+			os.Setenv(k, v)
+		}
+		fileKeys = m
+		st.Lock() // /metrics reads the settings under this lock
+		loadConfig()
+		listen, controlToken = oldListen, oldToken
+		st.mode, st.fixed = mode0, fixedPct0
+		st.Unlock()
+		log.Printf("reloaded %s: mode=%s", envFilePath(), mode0)
+	}, nil
 }
 
 // validateConfig refuses settings that would make the controller unsafe or stall the loop past the
@@ -436,6 +513,7 @@ type controller struct {
 	expect   map[string]bool // temperature sensors seen on the first good read
 	fansSeen map[string]bool // fans seen on the first good read
 	kick     chan struct{}   // ask the drive goroutine for an early re-read
+	reload   chan func()     // validated settings to apply before the next cycle
 
 	current         float64 // last duty sent; valid when manual
 	manual          bool
@@ -746,6 +824,12 @@ func (c *controller) safeStep() (err error) {
 func (c *controller) run() {
 	sdNotify("READY=1")
 	for {
+		select {
+		case apply := <-c.reload:
+			apply()
+			c.manual = false // re-send the duty under the new settings
+		default:
+		}
 		if err := c.safeStep(); err != nil { // any failure -> safe mode
 			st.Lock()
 			st.errors++
@@ -1068,19 +1152,41 @@ func main() {
 	case "prepare":
 		cmdPrepare()
 		return
+	case "check": // validate the settings in the environment (used by reload); exits 1 if refused
+		loadConfig()
+		fmt.Println("config ok")
+		return
 	case "run":
 	default:
-		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe|prepare]")
+		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe|prepare|check]")
 		os.Exit(2)
 	}
 
 	loadConfig()
 	st.mode, st.fixed = mode0, fixedPct0
+	fileKeys, _ = readEnvFile(envFilePath()) // systemd already loaded it; remember which keys it set
 	bmc, err := OpenBMC()
 	if err != nil {
 		log.Fatal(err)
 	}
-	c := &controller{bmc: bmc, kick: make(chan struct{}, 1)}
+	c := &controller{bmc: bmc, kick: make(chan struct{}, 1), reload: make(chan func(), 1)}
+
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			apply, err := prepareReload()
+			if err != nil {
+				log.Printf("reload: %v (keeping the current settings)", err)
+				continue
+			}
+			select {
+			case c.reload <- apply:
+			default:
+				log.Print("reload: one already pending")
+			}
+		}
+	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)

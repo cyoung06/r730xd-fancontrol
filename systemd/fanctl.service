@@ -10,6 +10,8 @@ EnvironmentFile=-/etc/fanctl.env
 # create the PERC ioctl node (the driver doesn't), outside the sandbox
 ExecStartPre=-+/usr/local/bin/fanctl prepare
 ExecStart=/usr/local/bin/fanctl
+# re-read /etc/fanctl.env without a restart (the fans stay under fanctl; a bad file is refused)
+ExecReload=/bin/kill -HUP $MAINPID
 # runs after every stop, crash or watchdog kill: fans back to the iDRAC
 ExecStopPost=/usr/local/bin/fanctl auto
 # the control loop pings every INTERVAL (<= 10 s); silent for 60 s -> killed and restarted

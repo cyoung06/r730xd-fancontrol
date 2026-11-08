@@ -23,6 +23,13 @@ Modes (`MODE`):
 | `fixed` | `FIXED_PCT` (the safety limits still apply) |
 | `auto`  | iDRAC automatic control |
 
+### Changing settings without a restart
+
+Edit `/etc/fanctl.env`, then `sudo systemctl reload fanctl`. fanctl re-reads the file, has `fanctl check`
+validate it in a subprocess, and swaps the settings in between two control cycles, so the fans never pass
+through the iDRAC. A refused file is logged and the running settings stay. `MODE`/`FIXED_PCT` from the file
+replace a choice made through `/control`; `LISTEN` and `CONTROL_TOKEN` still need a restart.
+
 ### The exhaust model (all modes with drive readings)
 
 The exhaust stands in for parts without a temperature sensor (PERC, RAM, PCIe cards). Most of its heat
