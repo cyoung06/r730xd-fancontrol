@@ -122,7 +122,7 @@ func defaults() config {
 	var c config
 	c.Mode = "model"
 	c.Shutdown.CPU, c.Shutdown.HDD, c.Shutdown.Exhaust = 85, 50, 65
-	c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp, c.Safe.CheckDuty = 20, 230, true, 15
+	c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp = 20, 230, true // check_duty: see parseConfig
 	m := &c.Model
 	m.MinDuty, m.FanMax, m.CPUTarget, m.Margin, m.CPULimit, m.EmergencyDuty = 10, 0, 75, 3, 78, 50
 	m.KI, m.IMax = 1.0, 15
@@ -160,6 +160,9 @@ func parseConfig(b []byte) (config, error) {
 	}
 	if c.Mode == "auto" {
 		c.Mode = "idrac"
+	}
+	if c.Safe.CheckDuty == 0 { // default: 15 %, never above safe.duty
+		c.Safe.CheckDuty = min(15, c.Safe.Duty)
 	}
 	if c.Fixed.CPUMax == 0 {
 		c.Fixed.CPUMax = c.Shutdown.CPU - 3

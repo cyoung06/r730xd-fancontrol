@@ -120,7 +120,9 @@ Errors are data, not branches. Each cycle: **sense → classify → pick → con
     not in effect after 15 s → shutdown.
   - shutdown: fans to the iDRAC, CPUs at minimum power, and a clean OS poweroff
     (`systemctl poweroff`), once.
-- **Act.** Each actuator is written only when it differs from what was last written.
+- **Act.** Each controller writes through one path: the clamp, then the power cap, then the fans,
+  each only when it differs (the cap also when its read-back differs; safe re-sends its duty while
+  the fans read low).
 
 A panic or an impossible value (NaN) in classify, pick or a controller → the safe controller. Inputs
 and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart continues a running gap.

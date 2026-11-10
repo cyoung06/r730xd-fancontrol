@@ -10,8 +10,9 @@ package main
 //	sense     stores each reading and when it last read valid
 //	classify  each input -> ok / unknown / danger (unknown: never seen, or unknownAfter past due)
 //	pick      (mode, worst class) -> one controller: shutdown, idrac, safe, fixed or model
-//	control   the picked controller writes what it wants (setFans, setCap, setClamp write only what
-//	          differs); whether it took is read back as inputs (fan RPM, power cap, clamp)
+//	control   the picked controller writes what it wants through apply (setFans, setCap, setClamp
+//	          write only what differs, the cap also when it reads back different, and safe re-sends
+//	          its duty while the fans read low); whether it took is read back as inputs
 //
 // A panic or an impossible value in classify, pick or a controller -> the safe controller.
 
@@ -142,6 +143,7 @@ type controller struct {
 	raplLearned     bool
 	hddSnap         time.Time         // drive snapshot last looked at (implausible values are logged once per snapshot)
 	readWhy         map[string]string // what each source answered for a reading it didn't give, this cycle
+	scanLogged      time.Time         // drive scan whose missing temperatures were logged
 	saveErr         string
 	poweredOff      bool // poweroff accepted: nothing more to do
 }
@@ -349,7 +351,7 @@ func (c *controller) logInputs(ns []named) {
 	}
 	for _, n := range ns {
 		w := c.readWhy[n.key]
-		if w == "" {
+		if w == "" && (n.kind == kindExhaust || n.kind == kindOtherTemp || n.kind == kindFan) { // from the BMC
 			w = c.readWhy["*"]
 		}
 		if w == "" {
@@ -360,7 +362,8 @@ func (c *controller) logInputs(ns []named) {
 			log.Printf("%sdrive scan found %g drives (inputs.hdd_min %d): unknown", prErr, v, hddMin)
 		case n.kind == kindFan && v < fanMinRPM && !isNeverSeen(n.r):
 			log.Printf("%sfan %s at %g rpm (inputs.fan_min_rpm %g): unknown", prErr, n.key, v, fanMinRPM)
-		case n.kind == kindDrive && c.in.HDD[strings.TrimPrefix(n.key, "drive ")].Seen.Before(c.in.Scan.Seen):
+		case n.kind == kindDrive && !isNeverSeen(n.r) && c.in.Scan.Seen != c.scanLogged &&
+			c.in.HDD[strings.TrimPrefix(n.key, "drive ")].Seen.Before(c.in.Scan.Seen):
 			log.Printf("%s%s: no temperature in the last scan, holding %g", prWarn, n.key, v)
 		}
 		switch r := n.r.(type) {
@@ -377,6 +380,7 @@ func (c *controller) logInputs(ns []named) {
 			}
 		}
 	}
+	c.scanLogged = c.in.Scan.Seen
 }
 
 func isCPU(k string) bool { return strings.HasPrefix(k, "CPU") }
@@ -673,7 +677,7 @@ func (c *controller) ctlModel(ns []named, now time.Time) error {
 	st.Lock()
 	st.demand, st.hasDemand, st.exhExpected = r.d, true, r.exhExpected
 	st.Unlock()
-	c.apply(strconv.Itoa(max(0, min(modelCeiling, int(math.Round(r.target))))), capW, false, r.why, now)
+	c.apply(strconv.Itoa(max(0, min(modelCeiling, int(math.Round(r.target))))), capW, false, false, r.why, now)
 	return nil
 }
 
@@ -682,12 +686,12 @@ func (c *controller) ctlFixed(now time.Time) {
 	st.Lock()
 	pct := st.fixed
 	st.Unlock()
-	c.apply(strconv.Itoa(pct), int(pcapMax), false, "fixed", now)
+	c.apply(strconv.Itoa(pct), int(pcapMax), false, false, "fixed", now)
 }
 
 // ctlIdrac: the iDRAC runs the fans.
 func (c *controller) ctlIdrac(now time.Time) {
-	c.apply("auto", int(pcapMax), false, "mode=idrac", now)
+	c.apply("auto", int(pcapMax), false, false, "mode=idrac", now)
 }
 
 // safeWindow: how long the safe controller may take to be in effect by its read-backs (the fans
@@ -702,17 +706,16 @@ func (c *controller) ctlSafe(why string, now time.Time) {
 	} else if bad := c.safeMismatch(now); bad == "" {
 		c.safeOK = now
 	} else if now.Sub(c.safeOK) >= safeWindow {
-		c.ctlShutdown("safe not established: " + bad)
+		c.ctlShutdown("safe not established: "+bad, now)
 		return
-	} else {
-		c.fan.have = "" // not in effect yet: send the duty again rather than wait for reassert
 	}
-	c.apply(strconv.Itoa(int(safeDuty)), int(safeCap), safeClamp, why, now)
+	// fans reading low: send the duty again now rather than at the next reassert
+	c.apply(strconv.Itoa(int(safeDuty)), int(safeCap), safeClamp, c.state == "safe" && c.safeFansLow(now), why, now)
 }
 
 // ctlShutdown: the poweroff first, so nothing after it can delay or stop it; then, once, the fans to
 // the iDRAC and the CPUs to minimum power, failures ignored (the machine is going down). Latched.
-func (c *controller) ctlShutdown(why string) {
+func (c *controller) ctlShutdown(why string, now time.Time) {
 	if c.off == "" {
 		c.off = why
 	}
@@ -726,8 +729,7 @@ func (c *controller) ctlShutdown(why string) {
 	}
 	if !c.shutdownTried { // once, each on its own (one failing can't skip the others); failures don't matter
 		c.shutdownTried = true
-		now := time.Now()
-		try("shutdown: fans to the iDRAC", func() { c.setFans("auto", why, now) })
+		try("shutdown: fans to the iDRAC", func() { c.setFans("auto", false, why, now) })
 		try("shutdown: CPU clamp", func() { c.setClamp(true, why) })
 		try("shutdown: power cap", func() { c.setCap(int(pcapMin), why, now) })
 	}
@@ -753,11 +755,27 @@ func (c *controller) safeMismatch(now time.Time) string {
 	if len(rpm) == 0 {
 		return strings.Join(append(bad, "no fan RPM"), "; ")
 	}
-	sort.Float64s(rpm)
-	if med, floor := rpm[len(rpm)/2], pctToRPM(safeCheckDuty); med < floor { // faster is fine: more cooling
+	if med, floor := median(rpm), pctToRPM(safeCheckDuty); med < floor { // faster is fine: more cooling
 		bad = append(bad, fmt.Sprintf("fans at %.0f rpm, want >= %.0f", med, floor))
 	}
 	return strings.Join(bad, "; ")
+}
+
+// safeFansLow: the fans read below safe.check_duty's RPM (or not at all).
+func (c *controller) safeFansLow(now time.Time) bool {
+	var rpm []float64
+	for _, in := range c.in.Fans {
+		if !in.Seen.IsZero() && c.overdue(in.Seen, interval, now) < unknownAfter {
+			rpm = append(rpm, in.V)
+		}
+	}
+	return len(rpm) == 0 || median(rpm) < pctToRPM(safeCheckDuty)
+}
+
+func median(v []float64) float64 {
+	v = slices.Clone(v)
+	sort.Float64s(v)
+	return v[len(v)/2]
 }
 
 // normal: the model's control law (unchanged from before the redesign; without a power reading it
@@ -857,18 +875,22 @@ func (c *controller) normal(temps, hdd map[string]float64, watts float64) (decis
 // ---------- writing: what the controllers call ----------
 
 // apply: the three actuators, always in this order: the clamp first (local, works without the BMC),
-// then the power cap, then the fans. Each writes only what differs.
-func (c *controller) apply(fans string, capW int, clamp bool, why string, now time.Time) {
+// then the power cap, then the fans. Each writes only what differs (the cap also when its read-back
+// differs); resendFans writes the duty even if it was the last one written.
+func (c *controller) apply(fans string, capW int, clamp bool, resendFans bool, why string, now time.Time) {
 	c.setClamp(clamp, why)
 	c.setCap(capW, why, now)
-	c.setFans(fans, why, now)
+	c.setFans(fans, resendFans, why, now)
 }
 
 // setFans: the duty ("auto": the iDRAC's control) when it isn't what was last written, and again every
 // inputs.reassert (retakes the fans after an iDRAC reset).
-func (c *controller) setFans(want, why string, now time.Time) {
-	if want == c.fan.have && now.Sub(c.fan.at) < reassert {
+func (c *controller) setFans(want string, resend bool, why string, now time.Time) {
+	if want == c.fan.have && now.Sub(c.fan.at) < reassert && !resend {
 		return
+	}
+	if resend && want == c.fan.have {
+		log.Printf("%sfans %s sent again: %s", prWarn, want, why)
 	}
 	var err error
 	if want == "auto" {
@@ -962,7 +984,7 @@ func try(step string, f func()) (ok bool) {
 func (c *controller) runController(name, why string, ns []named, now time.Time) error {
 	switch name {
 	case "shutdown":
-		c.ctlShutdown(why)
+		c.ctlShutdown(why, now)
 	case "idrac":
 		c.ctlIdrac(now)
 	case "safe":
