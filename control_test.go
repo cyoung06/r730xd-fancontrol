@@ -643,3 +643,130 @@ func TestRealCoretemp(t *testing.T) {
 		t.Fatalf("coretemp read: %v %v", cpus, why)
 	}
 }
+
+// Sensors fanctl discovers stay expected whatever required_temps lists: CPU2 and Exhaust are watched
+// with required_temps = [CPU1, Inlet] (the example config's shape).
+func TestCycleDiscoveredSensorsKept(t *testing.T) {
+	c, f, get := rig(t)
+	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"Inlet\"]\ninterval = \"5s\"\n"))
+	run(c, f, at(0))
+	for _, k := range []string{"CPU1", "CPU2", "Inlet", "Exhaust"} {
+		if c.in.Temps[k].Seen.IsZero() {
+			t.Fatalf("%s not expected/filled: %v", k, c.in.Temps)
+		}
+	}
+	f.missing["CPU2"] = true
+	for s := 5; s <= 20; s += 5 {
+		run(c, f, at(s))
+	}
+	want(t, 20, c, f, get, "20", int(pcapMin), true) // CPU2 is watched: unknown -> safe
+}
+
+// A cap the iDRAC reverted (its own reset) is written again, not left to fail safe into a shutdown.
+func TestCycleCapRewrittenOnReadback(t *testing.T) {
+	c, f, get := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	for s := 5; s <= 25; s += 5 {
+		run(c, f, at(s)) // safe from 20, cap 230
+	}
+	f.cap = int(pcapMax)        // the iDRAC put its own limit back
+	c.in.Cap.Seen = time.Time{} // force the next read-back
+	for s := 30; s <= 60; s += 5 {
+		run(c, f, at(s))
+	}
+	if calls != 0 || f.cap != int(safeCap) || c.last.state != "safe" {
+		t.Fatalf("reverted cap: poweroff %d, cap %d, %q", calls, f.cap, c.last.state)
+	}
+	_ = get
+}
+
+// A shutdown is final: the fans stay with the iDRAC while the OS powers off.
+func TestCycleShutdownLatched(t *testing.T) {
+	c, f, get := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.vals["Exhaust"] = exhaustAuto
+	for s := 5; s <= 15; s += 5 {
+		run(c, f, at(s))
+	}
+	f.vals["Exhaust"] = 30 // cooled, or the reading went away during the OS shutdown
+	f.missing["Inlet"] = true
+	for s := 20; s <= 80; s += 5 {
+		run(c, f, at(s))
+		want(t, s, c, f, get, "auto", int(pcapMin), true)
+	}
+	if calls != 1 {
+		t.Fatalf("poweroff calls %d", calls)
+	}
+}
+
+// decide failing goes through the safe path: the safe window starts, nothing powers off at once.
+func TestCycleDecideFailSafeWindow(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	st.Lock()
+	st.mode, st.fixed = "fixed", 100 // fans fast: they need time to come down to safe.duty
+	st.Unlock()
+	run(c, f, at(0))
+	fanRPMTab = curve{{10, 3270}} // one point (validation would refuse it): the model panics
+	defer loadConfigBytes(nil)
+	st.Lock()
+	st.mode = "model"
+	st.Unlock()
+	run(c, f, at(5))
+	if c.last.state != "safe" || calls != 0 {
+		t.Fatalf("decide failing: %q calls %d", c.last.state, calls)
+	}
+}
+
+// Without the clamp in [safe], intel_pstate isn't needed at all: a host without it runs normally.
+func TestCycleNoClampNoPstate(t *testing.T) {
+	c, f, _ := rig(t)
+	loadConfigBytes([]byte("[safe]\nclamp = false\n[inputs]\nrequired_temps = [\"CPU1\", \"CPU2\", \"Inlet\", \"Exhaust\"]\ninterval = \"5s\"\n"))
+	os.RemoveAll(pstateDir)
+	for s := 0; s <= 30; s += 5 {
+		run(c, f, at(s))
+	}
+	if c.last.state != "model" {
+		t.Fatalf("no intel_pstate, clamp unused: %q (%s)", c.last.state, c.last.why)
+	}
+}
+
+// A pulled drive's danger count is forgotten: reinserted, one reading at the line doesn't shut down.
+func TestCycleDangerCountForgotten(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	d := Drive{ID: 1, Serial: "Z1P34VPQ"}
+	set := func(ids []Drive, temps map[Drive]float64, s int) {
+		hdds.Lock()
+		hdds.ids, hdds.temps, hdds.at, hdds.scanned = ids, temps, at(s), true
+		hdds.Unlock()
+	}
+	set([]Drive{d}, map[Drive]float64{d: 30}, 0)
+	run(c, f, at(0))
+	set([]Drive{d}, map[Drive]float64{d: hddAuto}, 5)
+	run(c, f, at(5))
+	set([]Drive{d}, map[Drive]float64{d: hddAuto}, 10)
+	run(c, f, at(10))                 // 2/3
+	set(nil, map[Drive]float64{}, 15) // pulled (the scans agree)
+	run(c, f, at(15))
+	set([]Drive{d}, map[Drive]float64{d: hddAuto}, 20) // back, one reading at the line
+	run(c, f, at(20))
+	if calls != 0 {
+		t.Fatalf("one reading after reinsertion powered off")
+	}
+}

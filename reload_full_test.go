@@ -102,6 +102,10 @@ func TestReloadRefusesEmptyCurve(t *testing.T) {
 	if _, err := prepareReload(); err == nil {
 		t.Fatal("empty hdd_curve accepted")
 	}
+	os.WriteFile(file, []byte("[safe]\ncap = 230.5\n"), 0o600)
+	if _, err := prepareReload(); err == nil {
+		t.Fatal("fractional safe.cap accepted")
+	}
 }
 
 // A reload re-reading the same mode doesn't undo a fixed -> model hand-over; a changed mode applies.

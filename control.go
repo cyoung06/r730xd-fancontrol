@@ -140,6 +140,8 @@ type controller struct {
 	safeOK           time.Time            // safe: last cycle its readbacks matched (or it was entered)
 	danger           map[string]dangerRun // readings at/above their shutdown line, confirming
 	lastKick         time.Time            // last early drive re-read asked for
+	capWritten       bool                 // the cap was written: read it back next cycle
+	off              *desired             // the shutdown decided: it stays (latched)
 	bmcDown          bool                 // the BMC didn't answer this cycle
 
 	// normal control
@@ -208,8 +210,14 @@ func (c *controller) sense(now time.Time) {
 		}
 		log.Printf("temperature sensors: %s; fans: %d", fmtTemps(temps), len(fans))
 	}
+	for k := range c.in.Temps {
+		if v, ok := temps[k]; ok {
+			c.in.Temps[k] = input{v, now}
+		}
+	}
 	// required_temps follow the config (also after a reload, or state carried over from a run with
-	// other settings): a required one is expected even unseen; an unseen one no longer required goes
+	// other settings): a required one is expected even unseen. Only a key never seen can go, so a
+	// sensor fanctl discovered stays expected whatever required_temps says.
 	for _, k := range requiredTemps {
 		if _, ok := c.in.Temps[k]; !ok {
 			c.in.Temps[k] = input{}
@@ -220,17 +228,15 @@ func (c *controller) sense(now time.Time) {
 			delete(c.in.Temps, k)
 		}
 	}
-	for k := range c.in.Temps {
-		if v, ok := temps[k]; ok {
-			c.in.Temps[k] = input{v, now}
-		}
-	}
 	for k := range c.in.Fans {
 		if v, ok := fans[k]; ok {
 			c.in.Fans[k] = input{v, now}
 		}
 	}
-	if !c.bmcDown { // the BMC answered this cycle: read the cap back (a hung BMC costs one timeout, not two)
+	// the cap is read back every inputs.reassert and the cycle after a write (a hung BMC costs one
+	// timeout per cycle, not two)
+	if !c.bmcDown && (c.capWritten || now.Sub(c.in.Cap.Seen) >= reassert) {
+		c.capWritten = false
 		if pl, err := c.bmc.GetPowerLimit(); err == nil {
 			w := float64(pl.Watts)
 			if !pl.Active {
@@ -241,7 +247,7 @@ func (c *controller) sense(now time.Time) {
 			why["power cap"] = err.Error()
 		}
 	}
-	if clamped, err := clampState(); err == nil {
+	if clamped, err := clampState(); err == nil { // an input only when safe uses the clamp (readings)
 		c.in.Clamp = input{map[bool]float64{false: 0, true: 1}[clamped], now}
 	} else {
 		why["CPU clamp"] = err.Error()
@@ -342,8 +348,16 @@ func senseCoretemp() (cpus map[string]float64, why map[string]string) {
 // expected (a removal is only accepted once a second scan agrees, see hddLoop).
 func (c *controller) senseDrives(now time.Time) {
 	hdds.Lock()
-	ids, temps, at, scanned := hdds.ids, hdds.temps, hdds.at, hdds.scanned
+	ids, raw, at, scanned := hdds.ids, hdds.temps, hdds.at, hdds.scanned
 	hdds.Unlock()
+	temps := map[Drive]float64{} // a copy: the snapshot is shared with hddLoop, and /metrics reads st.hdd
+	for d, t := range raw {
+		if t > 0 && t < 100 { // a garbled SMART/LOG SENSE byte is no reading
+			temps[d] = t
+		} else if at != c.hddSnap {
+			log.Printf("%sdrive %s: implausible temperature %g C", prWarn, d.Serial, t)
+		}
+	}
 	st.Lock()
 	st.hdd = temps
 	st.Unlock()
@@ -356,12 +370,6 @@ func (c *controller) senseDrives(now time.Time) {
 	keep, missing := map[string]bool{}, []string{}
 	for _, d := range ids {
 		keep[d.Serial] = true
-		if t, ok := temps[d]; ok && !(t > 0 && t < 100) { // a garbled SMART/LOG SENSE byte is no reading
-			if at != c.hddSnap {
-				log.Printf("%sdrive %s: implausible temperature %g C", prWarn, d.Serial, t)
-			}
-			delete(temps, d)
-		}
 		if t, ok := temps[d]; ok {
 			if at.After(c.in.HDD[d.Serial].Seen) {
 				c.in.HDD[d.Serial] = input{t, at}
@@ -532,8 +540,10 @@ func (c *controller) readings(now time.Time) []named {
 		out = append(out, named{"drive " + k, kindDrive, readingOf(c.in.HDD[k], hddInterval+driveSlack, now)})
 	}
 	out = append(out, named{"drive scan", kindOther, readingOf(input{1, c.in.Drives}, hddInterval+driveSlack, now)})
-	out = append(out, named{"power cap", kindOther, readingOf(c.in.Cap, interval, now)})
-	out = append(out, named{"CPU clamp", kindOther, readingOf(c.in.Clamp, interval, now)})
+	out = append(out, named{"power cap", kindOther, readingOf(c.in.Cap, reassert, now)})
+	if safeClamp {
+		out = append(out, named{"CPU clamp", kindOther, readingOf(c.in.Clamp, interval, now)})
+	}
 	return out
 }
 
@@ -657,11 +667,21 @@ func (c *controller) decide(now time.Time) (desired, error) {
 	st.Lock()
 	mode, fixedPct := st.mode, st.fixed
 	st.Unlock()
+	if c.off != nil { // a shutdown is final: the poweroff is under way
+		return *c.off, nil
+	}
 	ns := c.readings(now)
 	worst, worstKey := classOK, ""
+	present := map[string]bool{}
 	for _, n := range ns {
+		present[n.key] = true
 		if k := c.confirm(n, classify(n), now); k > worst {
 			worst, worstKey = k, n.key
+		}
+	}
+	for k := range c.danger { // a key gone (pulled drive, required_temps change) starts over if it returns
+		if !present[k] {
+			delete(c.danger, k)
 		}
 	}
 	if len(c.in.Temps) == 0 || len(c.in.Fans) == 0 { // no sensor set yet: everything unknown
@@ -677,37 +697,51 @@ func (c *controller) decide(now time.Time) (desired, error) {
 		}
 	}
 	why := fmt.Sprintf("%s %s", worstKey, worst)
-	picked := pick(mode, worst)
-	if picked == "safe" {
-		if c.last.state != "safe" {
-			c.safeOK = now // just entered: the fans need a moment to reach safe.duty
-		} else if bad := c.safeMismatch(now); bad == "" {
-			c.safeOK = now
-		} else if now.Sub(c.safeOK) >= unknownAfter { // safe can't be established: last resort
-			picked, why = "shutdown", "safe not established: "+bad
-		}
-	}
-	switch picked {
-	case "shutdown": // orderly poweroff; meanwhile the iDRAC cools, the CPUs at minimum power
-		return desired{fan: "auto", cap: int(pcapMin), clamp: true, why: why, state: "shutdown", off: true}, nil
+	switch pick(mode, worst) {
+	case "shutdown":
+		return c.shutdown(why), nil
 	case "idrac":
 		return desired{fan: "auto", cap: int(pcapMax), why: "mode=idrac", state: "idrac"}, nil
 	case "safe":
-		return ctlSafe(why), nil
+		return c.safe(why, now), nil
 	case "fixed":
 		return desired{fan: strconv.Itoa(fixedPct), duty: float64(fixedPct), cap: int(pcapMax), why: "fixed", state: "fixed"}, nil
 	}
 	return c.ctlModel(ns, now)
 }
 
+// safeWindow: how long the safe controller may take to be in effect by its read-backs (the fans
+// spinning down from a high duty take a while).
+const safeWindow = 15 * time.Second
+
+// safe: the safe controller, checked by its read-backs; not in effect within safeWindow -> shutdown.
+// Every way into safe (unknown input, decide failing) goes through here.
+func (c *controller) safe(why string, now time.Time) desired {
+	if c.last.state != "safe" {
+		c.safeOK = now // just entered: the fans need a moment to reach safe.duty
+	} else if bad := c.safeMismatch(now); bad == "" {
+		c.safeOK = now
+	} else if now.Sub(c.safeOK) >= safeWindow { // safe can't be established: last resort
+		return c.shutdown("safe not established: " + bad)
+	}
+	return ctlSafe(why)
+}
+
+// shutdown: orderly poweroff; meanwhile the iDRAC cools, the CPUs at minimum power. Latched.
+func (c *controller) shutdown(why string) desired {
+	d := desired{fan: "auto", cap: int(pcapMin), clamp: true, why: why, state: "shutdown", off: true}
+	c.off = &d
+	return d
+}
+
 // safeMismatch: what the readbacks say differs from the safe controller's settings ("" = established).
 func (c *controller) safeMismatch(now time.Time) string {
 	usable := func(in input) bool { return !in.Seen.IsZero() && c.overdue(in.Seen, interval, now) < unknownAfter }
 	var bad []string
-	if !usable(c.in.Cap) || c.in.Cap.V != safeCap {
+	if c.in.Cap.Seen.IsZero() || c.overdue(c.in.Cap.Seen, reassert, now) >= unknownAfter || c.in.Cap.V != safeCap {
 		bad = append(bad, fmt.Sprintf("power cap reads %g W, want %g", c.in.Cap.V, safeCap))
 	}
-	if want := map[bool]float64{false: 0, true: 1}[safeClamp]; !usable(c.in.Clamp) || c.in.Clamp.V != want {
+	if safeClamp && (!usable(c.in.Clamp) || c.in.Clamp.V != 1) {
 		bad = append(bad, "CPU clamp not in place")
 	}
 	var rpm []float64
@@ -877,8 +911,9 @@ func (c *controller) act(d desired, now time.Time) {
 	}
 	c.clamp.result(want, err, now)
 
-	if w := strconv.Itoa(d.cap); c.pcap.have != w {
+	if w := strconv.Itoa(d.cap); c.pcap.have != w || (!c.in.Cap.Seen.IsZero() && !c.capWritten && c.in.Cap.V != float64(d.cap)) {
 		err := c.bmc.SetPowerCap(d.cap)
+		c.capWritten = true // read it back next cycle
 		if err != nil {
 			log.Printf("%spower cap %d W failed: %v", prErr, d.cap, err)
 		} else {
@@ -984,7 +1019,7 @@ func (c *controller) cycle(now time.Time) {
 	}
 	if err != nil { // a bug or an impossible value: nothing to trust but the safe controller
 		log.Printf("%sdecide: %v", prErr, err)
-		d = ctlSafe("decide failed: " + err.Error())
+		d = c.safe("decide failed: "+err.Error(), now)
 	}
 	try("act", func() { c.act(d, now) })
 	try("save", func() { c.saveState(now) })
