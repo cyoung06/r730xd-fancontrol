@@ -142,6 +142,7 @@ and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart contin
 | control loop hangs | systemd `WatchdogSec=60` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |
+| diagnosing (`sudo touch /etc/fanctl.idrac`) | within a cycle the iDRAC runs the fans and handles everything, real danger included: no safe, no shutdown from fanctl. Survives reboots; `sudo rm /etc/fanctl.idrac` hands the fans back |
 | iDRAC reset | fanctl re-sends its duty every `inputs.reassert` s and takes the fans back |
 
 ## Requirements

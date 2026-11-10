@@ -125,7 +125,11 @@ hdd_min = 0
 	oldP, oldT, oldS, oldH, oldM := pstateDir, throttleState, stateFile, hwmonDir, shutdownMark
 	pstateDir, throttleState, stateFile, hwmonDir = filepath.Join(dir, "intel_pstate"), filepath.Join(dir, "throttle"), filepath.Join(dir, "inputs.json"), filepath.Join(dir, "hwmon")
 	shutdownMark = filepath.Join(dir, "shutdown")
-	t.Cleanup(func() { pstateDir, throttleState, stateFile, hwmonDir, shutdownMark = oldP, oldT, oldS, oldH, oldM })
+	oldO := idracOverride
+	idracOverride = filepath.Join(dir, "fanctl.idrac")
+	t.Cleanup(func() {
+		pstateDir, throttleState, stateFile, hwmonDir, shutdownMark, idracOverride = oldP, oldT, oldS, oldH, oldM, oldO
+	})
 	for i, name := range []string{"power_meter", "coretemp", "coretemp"} { // like the server: hwmon0 power_meter, 1-2 coretemp
 		h := filepath.Join(hwmonDir, "hwmon"+strconv.Itoa(i))
 		os.MkdirAll(h, 0o755)
@@ -914,5 +918,33 @@ func TestCycleSafeMostFans(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("half the fans slow in safe: poweroff calls %d", calls)
+	}
+}
+
+// The override file hands everything to the iDRAC within a cycle, danger and unknown inputs included;
+// removing it gives the fans back to fanctl.
+func TestCycleIdracOverride(t *testing.T) {
+	c, f, get := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	os.WriteFile(idracOverride, nil, 0o644)
+	f.vals["Exhaust"] = exhaustAuto // danger
+	f.missing["Inlet"] = true       // and an unknown input
+	for s := 5; s <= 60; s += 5 {
+		run(c, f, at(s))
+		want(t, s, c, f, get, "auto", int(pcapMax), false)
+	}
+	if calls != 0 {
+		t.Fatalf("override on: poweroff called")
+	}
+	os.Remove(idracOverride)
+	f.vals["Exhaust"] = 30
+	f.missing["Inlet"] = false
+	run(c, f, at(65))
+	if c.state != "model" {
+		t.Fatalf("override removed: %q", c.state)
 	}
 }

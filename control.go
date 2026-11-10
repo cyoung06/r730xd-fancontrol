@@ -111,6 +111,10 @@ const (
 	kickEvery   = 30 * time.Second // missing drive temperatures: re-read at most this often
 )
 
+// idracOverride: while this file exists the iDRAC runs the fans and handles everything, real danger
+// included: no safe, no shutdown from fanctl (for diagnosing). In /etc, so it holds across a reboot.
+var idracOverride = "/etc/fanctl.idrac"
+
 // shutdownMark: present while a shutdown is under way ("fanctl auto" then keeps minimum power).
 var shutdownMark = "/run/fanctl/shutdown"
 
@@ -612,6 +616,9 @@ func overFixed(ns []named) (string, bool) {
 func (c *controller) choose(now time.Time) (name, why string, ns []named) {
 	if c.off != "" { // a shutdown is final: the poweroff is under way
 		return "shutdown", c.off, nil
+	}
+	if exists(idracOverride) { // the operator handed everything to the iDRAC, danger included
+		return "idrac", "override: " + idracOverride, nil
 	}
 	st.Lock()
 	mode := st.mode
