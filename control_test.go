@@ -167,7 +167,7 @@ func want(t *testing.T, s int, c *controller, f *fakeBMC, get func(string) strin
 	gotClamp := get("max_perf_pct") == "40" && get("no_turbo") == "1"
 	if f.fan != fan || f.cap != capW || gotClamp != clamped {
 		t.Fatalf("t=%ds: fan %q cap %d clamped %v; want fan %q cap %d clamped %v (reason %q)",
-			s, f.fan, f.cap, gotClamp, fan, capW, clamped, c.last.why)
+			s, f.fan, f.cap, gotClamp, fan, capW, clamped, c.why)
 	}
 }
 
@@ -177,8 +177,8 @@ func TestCycleNormal(t *testing.T) {
 		run(c, f, at(s))
 	}
 	want(t, 20, c, f, get, "10", int(pcapMax), false) // everything below the curves: MIN_PCT
-	if c.last.state != "model" {
-		t.Fatalf("controller %q", c.last.state)
+	if c.state != "model" {
+		t.Fatalf("controller %q", c.state)
 	}
 }
 
@@ -236,13 +236,13 @@ func TestCycleBMCDown(t *testing.T) {
 		run(c, f, at(s))
 	}
 	// BMC inputs unknown since t=20 -> safe; the CPUs stay visible (coretemp), the clamp (local) applies
-	if c.last.state != "safe" || get("max_perf_pct") != "40" || !c.in.Temps["CPU1"].Seen.Equal(at(30)) {
-		t.Fatalf("BMC down: %q clamp %s CPU1 seen %v", c.last.state, get("max_perf_pct"), c.in.Temps["CPU1"].Seen)
+	if c.state != "safe" || get("max_perf_pct") != "40" || !c.in.Temps["CPU1"].Seen.Equal(at(30)) {
+		t.Fatalf("BMC down: %q clamp %s CPU1 seen %v", c.state, get("max_perf_pct"), c.in.Temps["CPU1"].Seen)
 	}
 	// safe can't be confirmed (no fan RPM, no cap readback) for 15 s -> shutdown
 	run(c, f, at(35))
-	if c.last.state != "shutdown" || calls != 1 {
-		t.Fatalf("safe unconfirmable 15 s: %q, poweroff calls %d", c.last.state, calls)
+	if c.state != "shutdown" || calls != 1 {
+		t.Fatalf("safe unconfirmable 15 s: %q, poweroff calls %d", c.state, calls)
 	}
 }
 
@@ -256,8 +256,8 @@ func TestCycleWriteErrors(t *testing.T) {
 	f.capErr, f.dutyErr = errors.New("dcmi: cc 0xc1"), errors.New("fan duty: cc 0xc3")
 	for s := 5; s <= 40; s += 5 {
 		run(c, f, at(s))
-		if c.last.state != "fixed" {
-			t.Fatalf("t=%d: %q", s, c.last.state)
+		if c.state != "fixed" {
+			t.Fatalf("t=%d: %q", s, c.state)
 		}
 	}
 	f.capErr, f.dutyErr = nil, nil
@@ -279,12 +279,12 @@ func TestCycleSafeNotEstablished(t *testing.T) {
 	for s := 5; s <= 30; s += 5 { // safe from t=20; cap still reads 586
 		run(c, f, at(s))
 	}
-	if c.last.state != "safe" || calls != 0 {
-		t.Fatalf("t=30: %q calls %d", c.last.state, calls)
+	if c.state != "safe" || calls != 0 {
+		t.Fatalf("t=30: %q calls %d", c.state, calls)
 	}
 	run(c, f, at(35)) // 15 s in safe without its cap
-	if c.last.state != "shutdown" || calls != 1 {
-		t.Fatalf("safe not established 15 s: %q, poweroff calls %d", c.last.state, calls)
+	if c.state != "shutdown" || calls != 1 {
+		t.Fatalf("safe not established 15 s: %q, poweroff calls %d", c.state, calls)
 	}
 	want(t, 35, c, f, get, "auto", int(pcapMax), true) // shutdown: the iDRAC cools; the 230 W cap is still refused
 }
@@ -332,13 +332,13 @@ func TestCycleDanger(t *testing.T) {
 						hdds.Unlock()
 					}
 					run(c, f, at(s))
-					if i < 2 && (calls != 0 || c.last.state == "shutdown") {
+					if i < 2 && (calls != 0 || c.state == "shutdown") {
 						t.Fatalf("reading %d: shutdown before confirmation", i+1)
 					}
 				}
 				run(c, f, at(20))
-				if calls != 1 || c.last.state != "shutdown" {
-					t.Fatalf("poweroff calls %d, controller %q", calls, c.last.state)
+				if calls != 1 || c.state != "shutdown" {
+					t.Fatalf("poweroff calls %d, controller %q", calls, c.state)
 				}
 				want(t, 20, c, f, get, "auto", int(pcapMin), true)
 			})
@@ -409,8 +409,8 @@ func TestCycleRequiredTempsFollowConfig(t *testing.T) {
 	want(t, 5, c, f, get, "20", int(pcapMin), true) // the typo is never seen: unknown
 	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"Exhaust\"]\ninterval = \"5s\"\n"))
 	run(c, f, at(10))
-	if _, still := c.in.Temps["Exhuast"]; still || c.last.state != "model" {
-		t.Fatalf("typo still expected after the fix: %v, %q", c.in.Temps, c.last.state)
+	if _, still := c.in.Temps["Exhuast"]; still || c.state != "model" {
+		t.Fatalf("typo still expected after the fix: %v, %q", c.in.Temps, c.state)
 	}
 }
 
@@ -425,13 +425,13 @@ func TestCycleFixed(t *testing.T) {
 	want(t, 0, c, f, get, "100", int(pcapMax), false)
 	f.vals["CPU1"] = fixedCPUMax
 	run(c, f, at(5))
-	if c.last.state != "model" || st.mode != "model" {
-		t.Fatalf("at FIXED_CPU_MAX: controller %q mode %q", c.last.state, st.mode)
+	if c.state != "model" || st.mode != "model" {
+		t.Fatalf("at FIXED_CPU_MAX: controller %q mode %q", c.state, st.mode)
 	}
 	f.vals["CPU1"] = 50
 	run(c, f, at(10))
-	if c.last.state != "model" {
-		t.Fatalf("cooled down: back to %q, want to stay model", c.last.state)
+	if c.state != "model" {
+		t.Fatalf("cooled down: back to %q, want to stay model", c.state)
 	}
 }
 
@@ -683,8 +683,8 @@ func TestCycleCapRewrittenOnReadback(t *testing.T) {
 	for s := 30; s <= 60; s += 5 {
 		run(c, f, at(s))
 	}
-	if calls != 0 || f.cap != int(safeCap) || c.last.state != "safe" {
-		t.Fatalf("reverted cap: poweroff %d, cap %d, %q", calls, f.cap, c.last.state)
+	if calls != 0 || f.cap != int(safeCap) || c.state != "safe" {
+		t.Fatalf("reverted cap: poweroff %d, cap %d, %q", calls, f.cap, c.state)
 	}
 	_ = get
 }
@@ -731,8 +731,8 @@ func TestCycleDecideFailSafeWindow(t *testing.T) {
 	st.Unlock()
 	for s := 5; s <= 40; s += 5 { // the safe read-back check panics too: plain safe, no crash, no poweroff
 		run(c, f, at(s))
-		if c.last.state != "safe" || calls != 0 {
-			t.Fatalf("t=%d decide failing: %q calls %d", s, c.last.state, calls)
+		if c.state != "safe" || calls != 0 {
+			t.Fatalf("t=%d decide failing: %q calls %d", s, c.state, calls)
 		}
 	}
 }
@@ -750,8 +750,8 @@ func TestCycleShutdownPoweroffFirst(t *testing.T) {
 	for s := 5; s <= 25; s += 5 {
 		run(c, f, at(s))
 	}
-	if calls != 1 || c.last.state != "shutdown" {
-		t.Fatalf("poweroff calls %d, controller %q", calls, c.last.state)
+	if calls != 1 || c.state != "shutdown" {
+		t.Fatalf("poweroff calls %d, controller %q", calls, c.state)
 	}
 }
 
@@ -762,8 +762,8 @@ func TestCycleNewlyRequiredReading(t *testing.T) {
 	delete(c.in.Temps, "CPU2") // not expected so far (e.g. missing at the first good read)
 	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"CPU2\", \"Inlet\", \"Exhaust\"]\ninterval = \"5s\"\n"))
 	run(c, f, at(5))
-	if c.last.state != "model" || c.in.Temps["CPU2"].Seen.IsZero() {
-		t.Fatalf("newly required, reading: %q, CPU2 %v", c.last.state, c.in.Temps["CPU2"])
+	if c.state != "model" || c.in.Temps["CPU2"].Seen.IsZero() {
+		t.Fatalf("newly required, reading: %q, CPU2 %v", c.state, c.in.Temps["CPU2"])
 	}
 }
 
@@ -775,8 +775,8 @@ func TestCycleNoClampNoPstate(t *testing.T) {
 	for s := 0; s <= 30; s += 5 {
 		run(c, f, at(s))
 	}
-	if c.last.state != "model" {
-		t.Fatalf("no intel_pstate, clamp unused: %q (%s)", c.last.state, c.last.why)
+	if c.state != "model" {
+		t.Fatalf("no intel_pstate, clamp unused: %q (%s)", c.state, c.why)
 	}
 }
 
