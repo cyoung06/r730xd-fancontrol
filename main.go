@@ -2,31 +2,30 @@
 
 // fanctl: Dell R730xd fan controller + Prometheus exporter.
 //
-// Reads CPU/inlet/exhaust temps, fan RPM and wall power from the local BMC (/dev/ipmi0) and drive
-// temps through the PERC (megaraid passthrough), picks a fan duty, and sets it with Dell's OEM fan
-// commands. In model mode the duty comes from the fitted thermal model, and when the fans reach
-// FAN_MAX the iDRAC power cap holds the CPU at target instead.
+// Reads CPU temperatures from the kernel (coretemp), inlet/exhaust temps, fan RPM and wall power from the
+// local BMC (/dev/ipmi0), and drive temps through the PERC (megaraid passthrough). Each cycle classifies
+// every input (ok / unknown / danger) and the worst one picks the controller: model (power first via the
+// iDRAC cap, then fans), fixed, safe (unknown input: fixed duty, CPUs at minimum power), shutdown
+// (danger: orderly poweroff) or idrac. See control.go.
 //
-// Fail-safe: a failed sensor read, an over-limit temperature, missing drive temps, or this process
-// exiting hands control back to the iDRAC (automatic mode). Under systemd (Type=notify,
-// WatchdogSec) a hung control loop is killed, and ExecStopPost runs `fanctl auto`.
+// Settings: /etc/fanctl.toml (config.go). Under systemd (Type=notify, WatchdogSec) a hung control loop
+// is killed, and ExecStopPost runs `fanctl auto`: fans to the iDRAC, CPU clamp undone.
 //
-//	fanctl [run]   control loop (reads its settings from the environment)
-//	fanctl auto    hand the fans back to the iDRAC and exit
-//	fanctl probe   print every reading fanctl uses; changes nothing
-//	fanctl prepare create the PERC ioctl node if missing (run as root before the service)
+//	fanctl [run]          control loop
+//	fanctl auto           hand the fans back to the iDRAC and exit
+//	fanctl probe          print every reading fanctl uses; changes nothing
+//	fanctl prepare        create the PERC ioctl node if missing (run as root before the service)
+//	fanctl check [file|-] validate a config file; exit 1 if refused
 package main
 
 import (
 	"crypto/subtle"
-	"errors"
 	"fmt"
 	"log"
 	"math"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"runtime/debug"
 	"sort"
@@ -37,7 +36,7 @@ import (
 	"time"
 )
 
-// ---------- settings (environment, same names as the old Python fanctl) ----------
+// ---------- settings (loaded from /etc/fanctl.toml: config.go) ----------
 
 type point struct{ x, y float64 }
 type curve []point
@@ -52,213 +51,17 @@ var (
 	fixedPct0                                              int
 	minPct, cpuTarget, modelMargin, cpuLimit, emergencyPct float64
 	fanMax, pcapMin, pcapMax, pcapStep, kw, ki, iMax       float64
-	cpuAuto, hddAuto, exhaustAuto                          float64
+	cpuAuto, hddAuto, exhaustAuto                          float64 // danger: at or above -> orderly shutdown
+	fixedCPUMax, fixedHDDMax, fixedExhaustMax              float64 // fixed mode hands over to model at or above
 	interval, hddInterval, hddRescan, reassert             time.Duration
+	unknownAfter                                           time.Duration // past due -> unknown
+	safeDuty, safeCap                                      float64       // the safe controller
+	safeClamp                                              bool
 	cpuCurve, hddCurve, exhaustCurve, warmCurve, fanRPMTab curve
 	cpuModels                                              []cpuModel
-	exhaustModel                                           []float64 // a, b (EXHAUST_MODEL)
+	exhaustModel                                           []float64 // a, b (model.exhaust_model)
 	exhaustExcessCurve                                     curve
 )
-
-func env(k, def string) string {
-	if v, ok := os.LookupEnv(k); ok {
-		return v
-	}
-	return def
-}
-
-func envFloat(k, def string) float64 {
-	v, err := strconv.ParseFloat(strings.TrimSpace(env(k, def)), 64)
-	if err != nil {
-		log.Fatalf("%s: %v", k, err)
-	}
-	return v
-}
-
-func envSeconds(k, def string) time.Duration {
-	return time.Duration(envFloat(k, def) * float64(time.Second))
-}
-
-// envCurve parses "x:y,x:y,..." into points sorted by x.
-func envCurve(k, def string, minPoints int) curve {
-	var c curve
-	for _, f := range strings.Split(env(k, def), ",") {
-		xs, ys, ok := strings.Cut(strings.TrimSpace(f), ":")
-		x, err1 := strconv.ParseFloat(xs, 64)
-		y, err2 := strconv.ParseFloat(ys, 64)
-		if !ok || err1 != nil || err2 != nil {
-			log.Fatalf("%s: bad point %q", k, f)
-		}
-		c = append(c, point{x, y})
-	}
-	if len(c) < minPoints {
-		log.Fatalf("%s: needs at least %d points", k, minPoints)
-	}
-	sort.Slice(c, func(i, j int) bool { return c[i].x < c[j].x })
-	return c
-}
-
-func envModel(k, def string) cpuModel {
-	f := strings.Split(env(k, def), ",")
-	if len(f) != 5 {
-		log.Fatalf("%s: want pb,r0,k,n,scale", k)
-	}
-	v := make([]float64, 5)
-	for i, s := range f {
-		var err error
-		if v[i], err = strconv.ParseFloat(strings.TrimSpace(s), 64); err != nil {
-			log.Fatalf("%s: %v", k, err)
-		}
-	}
-	return cpuModel{v[0], v[1], v[2], v[3], v[4]}
-}
-
-func loadConfig() {
-	mode0 = env("MODE", "curve") // curve | model | fixed | auto
-	fixedPct0 = int(envFloat("FIXED_PCT", "20"))
-	minPct = envFloat("MIN_PCT", "10")
-	// duty = max of the three curves; below a curve's first point: MIN_PCT
-	cpuCurve = envCurve("CPU_CURVE", "55:10,62:15,68:25,74:40,80:60", 1)
-	hddCurve = envCurve("HDD_CURVE", "38:10,41:20,44:35,47:50", 1)
-	exhaustCurve = envCurve("EXHAUST_CURVE", "38:10,42:25,46:45", 1)
-	// The exhaust demand reacts only to heat the sensors don't explain (PERC, RAM, PCIe, a blocked vent).
-	// Expected exhaust, fitted on steady history (fit 2026-11-08 over 2026-10-31..11-08, rmse 1.2 C; airflow
-	// cancels out: faster fans take more heat off a part but spread it through proportionally more air):
-	//   T_exh = T_inlet + a * (T_cpu - T_inlet) + b * (T_hdd - T_inlet)    (hottest CPU, hottest drive)
-	// EXHAUST_EXCESS_CURVE maps the excess (measured - expected, C) to a duty. EXHAUST_AUTO still applies to
-	// the absolute exhaust, and a cycle without a drive reading falls back to the absolute EXHAUST_CURVE.
-	exhaustModel = nil // loadConfig also runs on reload: rebuild, never append to the old values
-	for _, f := range strings.Split(env("EXHAUST_MODEL", "0.3716,0.1911"), ",") {
-		x, err := strconv.ParseFloat(strings.TrimSpace(f), 64)
-		if err != nil {
-			log.Fatalf("EXHAUST_MODEL: %v", err)
-		}
-		exhaustModel = append(exhaustModel, x)
-	}
-	exhaustExcessCurve = envCurve("EXHAUST_EXCESS_CURVE", "3:10,5:20,7:40", 1)
-	// MODE=model: lowest duty that keeps the hottest CPU at CPU_TARGET, from the fitted steady-state model
-	//   T_cpu = T_inlet + (P - pb) * (r0 + k * (rpm/1000)^-n) * scale      (P = iDRAC wall power)
-	// plus a slow integral correction on the measured temperature (model error, dust, layout, room).
-	cpuTarget = envFloat("CPU_TARGET", "75")
-	modelMargin = envFloat("MODEL_MARGIN", "3") // model aims this far below CPU_TARGET
-	cpuLimit = envFloat("CPU_LIMIT", "78")      // at/above: jump to EMERGENCY_PCT at once
-	emergencyPct = envFloat("EMERGENCY_PCT", "50")
-	cpuModels = []cpuModel{ // pb,r0,k,n,scale (fit 2026-10-31, current drive layout)
-		envModel("CPU1_MODEL", "58.6228,0.1107,0.6588,1.4572,0.9565"),
-		envModel("CPU2_MODEL", "89.5481,0.1445,1.1485,1.8038,1.0562")}
-	fanRPMTab = envCurve("FAN_RPM_TABLE", "10:3270,15:4060,20:4790,25:5560,30:6430", 2)
-	// fan ceiling: in model mode the CPU part of the demand never exceeds FAN_MAX; instead the iDRAC
-	// power cap is set to the most power that settles at CPU_TARGET with the fans at FAN_MAX
-	fanMax = envFloat("FAN_MAX", "0")     // 0 = no ceiling, no cap management
-	pcapMin = envFloat("PCAP_MIN", "230") // never cap below this (W)
-	pcapMax = envFloat("PCAP_MAX", "586") // "no cap" (the iDRAC's highest accepted limit)
-	pcapStep = envFloat("PCAP_STEP", "6") // only re-send when the cap moves this much (W)
-	kw = envFloat("PCAP_KW", "8")         // cap correction, W per C per minute
-	// model mode: fan floor that rises as the hottest CPU warms, so a warm CPU keeps headroom for a load step
-	warmCurve = envCurve("WARM_CURVE", "68:10,72:15,76:20", 1)
-	ki = envFloat("MODEL_KI", "1.0")     // % per C per minute
-	iMax = envFloat("MODEL_I_MAX", "15") // correction limit, +/- %
-	cpuAuto = envFloat("CPU_AUTO", "85")
-	hddAuto = envFloat("HDD_AUTO", "50")
-	exhaustAuto = envFloat("EXHAUST_AUTO", "50")
-	interval = envSeconds("INTERVAL", "10")
-	hddInterval = envSeconds("HDD_INTERVAL", "300")
-	hddRescan = envSeconds("HDD_RESCAN", "600") // look for inserted/removed drives
-	reassert = envSeconds("REASSERT", "60")     // re-send the duty this often
-	listen = env("LISTEN", "127.0.0.1:9101")    // comma-separated
-	controlToken = env("CONTROL_TOKEN", "")     // empty = /control disabled
-	// temperatures that must read every cycle (a missing one never counts as "cool")
-	requiredTemps = nil
-	for _, t := range strings.Split(env("REQUIRED_TEMPS", "CPU1,Inlet,Exhaust"), ",") {
-		if t = strings.TrimSpace(t); t != "" {
-			requiredTemps = append(requiredTemps, t)
-		}
-	}
-	hddMin = int(envFloat("HDD_MIN", "0"))      // fewer drives seen -> iDRAC
-	fanMinRPM = envFloat("FAN_MIN_RPM", "1000") // a fan below this (dead/stalled) -> iDRAC
-	switch mode0 {
-	case "curve", "model", "fixed", "auto":
-	default:
-		log.Fatalf("MODE must be curve, model, fixed or auto")
-	}
-	validateConfig()
-}
-
-// ---------- reload (systemctl reload fanctl = SIGHUP) ----------
-//
-// systemd hands the settings over as environment variables (EnvironmentFile), read once at start. On a
-// reload fanctl reads the env file itself, has a "fanctl check" subprocess validate it (a bad value there
-// exits that process, not this one), and only then swaps the settings in between two control cycles, so
-// the fans never pass through the iDRAC. MODE/FIXED_PCT from the file replace a runtime /control choice.
-// LISTEN and CONTROL_TOKEN changes need a restart.
-
-func envFilePath() string { return env("FANCTL_ENV_FILE", "/etc/fanctl.env") }
-
-// readEnvFile parses KEY=VALUE lines like systemd's EnvironmentFile: blank lines and # or ; comments are
-// skipped, and one pair of surrounding quotes is removed.
-func readEnvFile(path string) (map[string]string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	m := map[string]string{}
-	for _, l := range strings.Split(string(b), "\n") {
-		l = strings.TrimSpace(l)
-		if l == "" || l[0] == '#' || l[0] == ';' {
-			continue
-		}
-		k, v, ok := strings.Cut(l, "=")
-		if !ok {
-			continue
-		}
-		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
-		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
-			v = v[1 : len(v)-1]
-		}
-		m[k] = v
-	}
-	return m, nil
-}
-
-var fileKeys map[string]string // what the env file held at the last (re)load
-
-// prepareReload reads and validates the env file; the returned func applies it (call between cycles).
-func prepareReload() (func(), error) {
-	m, err := readEnvFile(envFilePath())
-	if err != nil {
-		return nil, err
-	}
-	self, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	cmd := exec.Command(self, "check")
-	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
-	for k, v := range m {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("%s refused: %s", envFilePath(), strings.TrimSpace(string(out)))
-	}
-	return func() {
-		oldListen, oldToken := listen, controlToken
-		for k := range fileKeys { // a line removed from the file falls back to its default
-			if _, still := m[k]; !still {
-				os.Unsetenv(k)
-			}
-		}
-		for k, v := range m {
-			os.Setenv(k, v)
-		}
-		fileKeys = m
-		st.Lock() // /metrics reads the settings under this lock
-		loadConfig()
-		listen, controlToken = oldListen, oldToken
-		st.mode, st.fixed = mode0, fixedPct0
-		st.Unlock()
-		log.Printf("reloaded %s: mode=%s", envFilePath(), mode0)
-	}, nil
-}
 
 // validateConfig refuses settings that would make the controller unsafe or stall the loop past the
 // systemd watchdog. A refused config exits, and systemd leaves the fans with the iDRAC.
@@ -279,34 +82,40 @@ func validateConfig() {
 	pct := func(v float64) bool { return v >= 0 && v <= 100 }
 	check(fin(minPct, cpuTarget, modelMargin, cpuLimit, emergencyPct, fanMax, pcapMin, pcapMax, pcapStep, kw, ki, iMax,
 		cpuAuto, hddAuto, exhaustAuto, fanMinRPM), "settings must be finite numbers")
-	check(interval >= time.Second && interval <= 10*time.Second, "INTERVAL must be 1-10 s (the systemd watchdog is 60 s)")
-	check(hddInterval >= 10*time.Second && hddRescan >= hddInterval, "need HDD_INTERVAL >= 10 s and HDD_RESCAN >= HDD_INTERVAL")
-	check(reassert >= interval, "REASSERT must be >= INTERVAL")
-	check(minPct >= 1 && minPct <= 100, "MIN_PCT must be 1-100")
-	check(fixedPct0 >= 5 && fixedPct0 <= 100, "FIXED_PCT must be 5-100")
-	check(fanMax == 0 || (fanMax >= minPct && fanMax <= 100), "FAN_MAX must be 0 or MIN_PCT-100")
-	check(emergencyPct >= minPct && emergencyPct <= 100, "EMERGENCY_PCT must be MIN_PCT-100")
+	check(interval >= time.Second && interval <= 10*time.Second, "inputs.interval must be 1-10 s (the systemd watchdog is 60 s)")
+	check(hddInterval >= 10*time.Second && hddRescan >= hddInterval, "need inputs.hdd_interval >= 10 s and inputs.hdd_rescan >= inputs.hdd_interval")
+	check(reassert >= interval, "inputs.reassert must be >= inputs.interval")
+	check(minPct >= 1 && minPct <= 100, "model.min_duty must be 1-100")
+	check(fixedPct0 >= 0 && fixedPct0 <= 100, "fixed.duty must be 0-100")
+	check(fin(fixedCPUMax, fixedHDDMax, fixedExhaustMax) && fixedCPUMax < cpuAuto && fixedHDDMax < hddAuto && fixedExhaustMax < exhaustAuto,
+		"fixed.cpu_max / hdd_max / exhaust_max must be finite and below shutdown.cpu / hdd / exhaust")
+	check(fanMax == 0 || (fanMax >= minPct && fanMax <= 100), "model.fan_max must be 0 or model.min_duty-100")
+	check(emergencyPct >= minPct && emergencyPct <= modelCeiling, "model.emergency_duty must be model.min_duty-%d", modelCeiling)
 	check(cpuTarget-modelMargin > 20 && cpuTarget < cpuLimit && cpuLimit < cpuAuto && cpuAuto <= 100,
-		"need 20 < CPU_TARGET-MODEL_MARGIN, CPU_TARGET < CPU_LIMIT < CPU_AUTO <= 100")
-	check(hddAuto > 0 && hddAuto <= 70 && exhaustAuto > 0 && exhaustAuto <= 80, "HDD_AUTO must be <= 70, EXHAUST_AUTO <= 80")
+		"need 20 < model.cpu_target - model.margin, cpu_target < model.cpu_limit < shutdown.cpu <= 100")
+	check(hddAuto > 0 && hddAuto <= 70 && exhaustAuto > 0 && exhaustAuto <= 80, "shutdown.hdd must be <= 70, shutdown.exhaust <= 80")
 	check(pcapMin >= 100 && pcapMin < pcapMax && pcapMax <= 2000 && pcapMax == math.Trunc(pcapMax) && pcapStep > 0,
-		"need 100 <= PCAP_MIN < PCAP_MAX <= 2000, PCAP_MAX a whole number, PCAP_STEP > 0")
-	check(hddMin >= 0 && fanMinRPM >= 0, "HDD_MIN and FAN_MIN_RPM must be >= 0")
-	check(ki >= 0 && iMax >= 0 && kw >= 0, "MODEL_KI, MODEL_I_MAX, PCAP_KW must be >= 0")
+		"need 100 <= power.cap_min < power.cap_max <= 2000, cap_max a whole number, power.cap_step > 0")
+	check(fin(safeDuty, safeCap) && safeDuty >= minPct && safeDuty <= 100 && safeCap >= pcapMin && safeCap <= pcapMax,
+		"safe.duty must be model.min_duty-100, safe.cap power.cap_min-power.cap_max")
+	check(unknownAfter >= interval && unknownAfter <= time.Minute, "inputs.unknown_after must be inputs.interval-60 s")
+	check(len(cpuModels) >= 1 && len(fanRPMTab) >= 2, "model.cpu_models needs >= 1 entry, model.fan_rpm_table >= 2 points")
+	check(hddMin >= 0 && fanMinRPM >= 0, "inputs.hdd_min and inputs.fan_min_rpm must be >= 0")
+	check(ki >= 0 && iMax >= 0 && kw >= 0, "model.ki, model.i_max, power.kw must be >= 0")
 	check(len(exhaustModel) == 2 && fin(exhaustModel...) && exhaustModel[0] >= 0 && exhaustModel[1] >= 0 && exhaustModel[0]+exhaustModel[1] < 1,
-		"EXHAUST_MODEL: need a,b >= 0 with a+b < 1 (the exhaust is a mix of inlet air and air warmed by the parts)")
-	for name, c := range map[string]curve{"CPU_CURVE": cpuCurve, "HDD_CURVE": hddCurve, "EXHAUST_CURVE": exhaustCurve, "WARM_CURVE": warmCurve, "EXHAUST_EXCESS_CURVE": exhaustExcessCurve} {
+		"model.exhaust_model: need [a, b] >= 0 with a+b < 1 (the exhaust is a mix of inlet air and air warmed by the parts)")
+	for name, c := range map[string]curve{"model.cpu_curve": cpuCurve, "model.hdd_curve": hddCurve, "model.exhaust_curve": exhaustCurve, "model.warm_curve": warmCurve, "model.exhaust_excess_curve": exhaustExcessCurve} {
 		for _, p := range c {
 			check(fin(p.x) && pct(p.y), "%s: bad point %g:%g (duty must be 0-100)", name, p.x, p.y)
 		}
 	}
 	for i, p := range fanRPMTab {
 		check(pct(p.x) && fin(p.y) && p.y > 0 && (i == 0 || (p.x > fanRPMTab[i-1].x && p.y > fanRPMTab[i-1].y)),
-			"FAN_RPM_TABLE must rise in both duty and rpm")
+			"model.fan_rpm_table must rise in both duty and rpm")
 	}
 	for i, m := range cpuModels {
 		check(fin(m.pb, m.r0, m.k, m.n, m.scale) && m.pb >= 0 && m.pb < 1000 && m.r0 >= 0 && m.k > 0 && m.n > 0 && m.n < 10 && m.scale > 0,
-			"CPU%d_MODEL: need finite pb (0-1000), r0 >= 0, k > 0, n (0-10), scale > 0", i+1)
+			"model.cpu_models[%d]: need finite pb (0-1000), r0 >= 0, k > 0, n (0-10), scale > 0", i)
 	}
 }
 
@@ -328,9 +137,10 @@ var st = struct {
 	modelI             float64
 	modelOn, hasDemand bool
 	demand             demand
-	exhExpected        float64 // 0 = not computed (no model or no drive temperature)
-	gap                int     // controller.gapLevel of the last read
-	throttled          bool    // CPUs throttled for a sensor gap
+	exhExpected        float64            // 0 = not computed (no model or no drive temperature)
+	ages               map[string]float64 // seconds since each expected input last read valid
+	state              string             // the controller that ran last
+	clamped            bool
 }{duty: -1, auto: 1, reason: "start"}
 
 // drive temperatures, refreshed by their own goroutine so a slow or hung drive never stalls the loop
@@ -344,7 +154,7 @@ var hdds = struct {
 
 // ---------- model ----------
 
-func interp(c curve, v float64) float64 { // MIN_PCT below the first point, last y above the last
+func interp(c curve, v float64) float64 { // model.min_duty below the first point, last y above the last
 	if v <= c[0].x {
 		return math.Max(minPct, c[0].y)
 	}
@@ -356,7 +166,7 @@ func interp(c curve, v float64) float64 { // MIN_PCT below the first point, last
 	return c[len(c)-1].y
 }
 
-// rpmToPct inverts FAN_RPM_TABLE (duty:rpm), linear between points, extrapolated past the ends.
+// rpmToPct inverts model.fan_rpm_table (duty:rpm), linear between points, extrapolated past the ends.
 func rpmToPct(rpm float64) float64 {
 	t := fanRPMTab
 	for i := 1; ; i++ {
@@ -375,7 +185,7 @@ func pctToRPM(pct float64) float64 {
 	}
 }
 
-// modelPct: lowest duty at which every CPU settles at CPU_TARGET for this power and inlet, or 100.
+// modelPct: lowest duty at which every CPU settles at model.cpu_target for this power and inlet, or 100.
 func modelPct(watts, inlet float64) float64 {
 	need := minPct
 	for _, m := range cpuModels {
@@ -391,7 +201,7 @@ func modelPct(watts, inlet float64) float64 {
 	return math.Min(100, need)
 }
 
-// modelMaxWatts: most wall power at which every CPU settles at CPU_TARGET with the fans at pct.
+// modelMaxWatts: most wall power at which every CPU settles at model.cpu_target with the fans at pct.
 func modelMaxWatts(inlet, pct float64) float64 {
 	x, w := pctToRPM(pct)/1000, math.Inf(1)
 	for _, m := range cpuModels {
@@ -424,10 +234,10 @@ type decision struct {
 	d                   demand
 	modelPart, warmPart float64
 	modelRan            bool
-	exhExpected         float64 // EXHAUST_MODEL's expected exhaust, 0 = not used this cycle
+	exhExpected         float64 // model.exhaust_model's expected exhaust, 0 = not used this cycle
 }
 
-func decide(temps map[string]float64, hdd map[Drive]float64, watts float64, model bool, modelI float64) decision {
+func decide(temps, hdd map[string]float64, watts float64, model bool, modelI float64) decision {
 	var r decision
 	cpu, exhaust, disk := hottestCPU(temps), temps["Exhaust"], 0.0
 	for _, v := range hdd {
@@ -510,585 +320,12 @@ func readInt(p string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
 }
 
-// ---------- control loop ----------
-
-type controller struct {
-	bmc      *BMC
-	sensors  []Sensor
-	expect   map[string]bool // temperature sensors seen on the first good read
-	fansSeen map[string]bool // fans seen on the first good read
-	kick     chan struct{}   // ask the drive goroutine for an early re-read
-	reload   chan func()     // validated settings to apply before the next cycle
-
-	current         float64 // last duty sent; valid when manual
-	manual          bool
-	sentAt          time.Time
-	modelI, capCorr float64
-	lastCap         float64 // valid when capSet
-	capSet          bool
-	hotHist         []float64 // hottest CPU, last 60 s
-	raplOff         float64   // learned wall - RAPL offset (W); valid when raplLearned
-	raplLearned     bool
-
-	// sensor gaps (the iDRAC drops a reading for ~10 s now and then)
-	tempGaps, fanGaps gapTracker
-	gapLevel          int  // this cycle: 0 all real, 1 holding a last value, 2 holding + floor + throttle
-	throttled         bool // CPU clamp / PCAP_MIN applied for a gap
-}
-
-// A missing temperature or fan reading is replaced by its last real value. After gapHold the duty
-// is held at >= gapFloor and the CPUs are throttled (frequency clamp + iDRAC cap at PCAP_MIN) until
-// the reading returns.
-const (
-	gapFloor = 25.0
-	gapHold  = 20 * time.Second
-)
-
-// journald priority prefixes (SyslogLevelPrefix): what a log watcher filters on
-const (
-	prErr  = "<3>"
-	prWarn = "<4>"
-)
-
-type gapTracker struct {
-	last map[string]float64   // last real reading
-	gone map[string]time.Time // first cycle without a reading, while it is missing
-	miss map[string]int       // cycles without a reading, while it is missing
-}
-
-// fill puts the last real value into m for each expected key that has no reading this cycle and
-// returns the gap level (0-2). why holds the BMC's answer for each rejected reading. A key never
-// seen with a value has nothing to hold: error.
-func (g *gapTracker) fill(kind, unit string, m map[string]float64, expect map[string]bool, why map[string]string, now time.Time) (int, error) {
-	if g.last == nil {
-		g.last, g.gone, g.miss = map[string]float64{}, map[string]time.Time{}, map[string]int{}
-	}
-	keys := make([]string, 0, len(expect))
-	for k := range expect {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	level := 0
-	for _, k := range keys {
-		if v, ok := m[k]; ok {
-			if since, gone := g.gone[k]; gone {
-				log.Printf("%s%s %s reading back after %d missed reads (%s): %g%s", prWarn, kind, k, g.miss[k], now.Sub(since).Round(time.Second), v, unit)
-				delete(g.gone, k)
-				delete(g.miss, k)
-			}
-			g.last[k] = v
-			continue
-		}
-		w := why[k]
-		if w == "" {
-			w = "not in reply"
-		}
-		last, have := g.last[k]
-		if !have {
-			return level, fmt.Errorf("%s %s stopped reporting (%s), no earlier reading", kind, k, w)
-		}
-		since, gone := g.gone[k]
-		if !gone {
-			since = now
-			g.gone[k] = now
-		}
-		g.miss[k]++
-		d := now.Sub(since)
-		if d < gapHold {
-			log.Printf("%s%s %s: no reading (%s), missed %d for %s: holding last %g%s",
-				prWarn, kind, k, w, g.miss[k], d.Round(time.Second), last, unit)
-			level = max(level, 1)
-		} else {
-			log.Printf("%s%s %s: no reading (%s), missed %d for %s: holding last %g%s, duty >= %.0f%%, CPU throttled",
-				prErr, kind, k, w, g.miss[k], d.Round(time.Second), last, unit, gapFloor)
-			level = 2
-		}
-		m[k] = last
-	}
-	return level, nil
-}
-
-// fillGaps fills missing temperature and fan readings (see gapTracker) and sets c.gapLevel.
-func (c *controller) fillGaps(temps, fans map[string]float64, why map[string]string, now time.Time) (err error) {
-	c.gapLevel = 0
-	defer func() {
-		st.Lock()
-		st.gap = c.gapLevel
-		st.Unlock()
-	}()
-	lt, err := c.tempGaps.fill("temperature", "C", temps, c.expect, why, now)
-	c.gapLevel = lt
-	if err != nil {
-		return err
-	}
-	lf, err := c.fanGaps.fill("fan", " rpm", fans, c.fansSeen, why, now)
-	c.gapLevel = max(lt, lf)
-	return err
-}
-
-// ---------- CPU throttle (RAPL is locked by the BIOS: clamp the frequency through intel_pstate) ----------
-
-var (
-	pstateDir     = "/sys/devices/system/cpu/intel_pstate"
-	throttleState = "/run/fanctl/throttle" // the values the clamp replaced; present while clamped
-)
-
-func readTrim(p string) (string, error) {
-	b, err := os.ReadFile(p)
-	return strings.TrimSpace(string(b)), err
-}
-
-func writePstate(name, v string) error {
-	if err := os.WriteFile(pstateDir+"/"+name, []byte(v), 0); err != nil {
-		return fmt.Errorf("intel_pstate %s=%s: %w", name, v, err)
-	}
-	return nil
-}
-
-// throttleOn turns turbo off and caps the CPUs at their lowest frequency, saving the old settings
-// first (a crash while clamped is undone by "fanctl auto" or the next start). Idempotent.
-func throttleOn() error {
-	if _, err := os.Stat(throttleState); err != nil {
-		nt, err1 := readTrim(pstateDir + "/no_turbo")
-		mx, err2 := readTrim(pstateDir + "/max_perf_pct")
-		if err := errors.Join(err1, err2); err != nil {
-			return fmt.Errorf("read intel_pstate: %w", err)
-		}
-		if err := os.WriteFile(throttleState, []byte(nt+" "+mx+"\n"), 0o644); err != nil {
-			return fmt.Errorf("save CPU settings before the clamp: %w", err)
-		}
-	}
-	mn, err := readTrim(pstateDir + "/min_perf_pct")
-	if err != nil {
-		return fmt.Errorf("read intel_pstate: %w", err)
-	}
-	return errors.Join(writePstate("no_turbo", "1"), writePstate("max_perf_pct", mn))
-}
-
-// throttleOff restores what throttleOn saved (restored=false: nothing was clamped).
-func throttleOff() (restored bool, err error) {
-	b, err := os.ReadFile(throttleState)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
-	f := strings.Fields(string(b))
-	if len(f) != 2 {
-		return false, fmt.Errorf("%s: unexpected content %q", throttleState, b)
-	}
-	if err := errors.Join(writePstate("max_perf_pct", f[1]), writePstate("no_turbo", f[0])); err != nil {
-		return false, err
-	}
-	return true, os.Remove(throttleState)
-}
-
-// undoLeftClamp restores a clamp left by a run that died while throttled.
-func undoLeftClamp() {
-	if ok, err := throttleOff(); err != nil {
-		log.Printf("%sCPU frequency restore failed: %v", prErr, err)
-	} else if ok {
-		log.Printf("%sCPU frequency clamp from an earlier run undone", prWarn)
-	}
-}
-
-// throttle applies (on) or releases the gap throttle. It fails only when neither the clamp nor the
-// power cap could be applied; each failure is logged.
-func (c *controller) throttle(on bool) error {
-	if on {
-		if !c.throttled {
-			log.Printf("%sthrottling CPUs: sensor reading missing for %s", prErr, gapHold)
-		}
-		errC := throttleOn()
-		if errC != nil {
-			log.Printf("%sCPU frequency clamp failed: %v", prErr, errC)
-		}
-		var errP error
-		st.Lock()
-		capNow := st.powerCap
-		st.Unlock()
-		if !c.throttled || capNow != int(pcapMin) {
-			if errP = c.bmc.SetPowerCap(int(pcapMin)); errP != nil {
-				log.Printf("%spower cap %d W failed: %v", prErr, int(pcapMin), errP)
-			} else {
-				st.Lock()
-				st.powerCap = int(pcapMin)
-				st.Unlock()
-				log.Printf("%spower cap %d W (PCAP_MIN, sensor gap)", prWarn, int(pcapMin))
-			}
-		}
-		c.capSet = false // normal cap control starts over afterwards
-		if !c.throttled && errC != nil && errP != nil {
-			return fmt.Errorf("could not throttle the CPUs (clamp: %v; power cap: %v)", errC, errP)
-		}
-		c.throttled = errC == nil || errP == nil || c.throttled
-		st.Lock()
-		st.throttled = c.throttled
-		st.Unlock()
-		return nil
-	}
-	if !c.throttled {
-		return nil
-	}
-	if _, err := throttleOff(); err != nil {
-		log.Printf("%sCPU frequency restore failed: %v (retrying)", prErr, err)
-		return nil // stays throttled; retried next cycle
-	}
-	c.throttled, c.capSet = false, false
-	st.Lock()
-	st.throttled = false
-	st.Unlock()
-	log.Printf("%sCPU throttle released: sensor readings back", prWarn)
-	return nil
-}
-
-func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, err error) {
-	if c.sensors == nil {
-		if c.sensors, err = c.bmc.Sensors(); err != nil {
-			c.sensors = nil
-			return nil, nil, 0, fmt.Errorf("sensor repository: %w", err)
-		}
-		log.Printf("sensor repository: %d temperature/fan/power sensors", len(c.sensors))
-	}
-	temps, fans = map[string]float64{}, map[string]float64{}
-	why := map[string]string{} // rejected readings: the BMC's answer
-	for _, s := range c.sensors {
-		v, ok, w, err := c.bmc.Reading(s)
-		if err != nil && s.Type != sensorCurrent { // a failed power read is tolerated
-			return nil, nil, 0, fmt.Errorf("read %s: %w", s.Name, err)
-		}
-		var key string
-		switch s.Type {
-		case sensorTemp:
-			if s.Entity == 3 { // entity 3.x = processor x
-				key = fmt.Sprintf("CPU%d", s.Inst)
-			} else {
-				key = strings.ReplaceAll(strings.ReplaceAll(s.Name, " Temp", ""), " ", "_")
-			}
-		case sensorFan:
-			key = strings.ReplaceAll(s.Name, " RPM", "")
-		}
-		if !ok {
-			if key != "" {
-				why[key] = w
-			}
-			continue
-		}
-		switch s.Type {
-		case sensorTemp:
-			temps[key] = v
-		case sensorFan:
-			fans[key] = v
-		case sensorCurrent:
-			watts = v
-		}
-	}
-	if len(temps) == 0 || len(fans) == 0 {
-		c.sensors = nil // walk the repository again next time
-		return nil, nil, 0, fmt.Errorf("empty sensor read (%d temperatures, %d fans; rejected: %v)", len(temps), len(fans), why)
-	}
-	// a temperature that drops out for good must not look like a cool part, and a garbage value must
-	// not either: both fail the cycle (-> iDRAC)
-	if c.expect == nil {
-		if hottestCPU(temps) == 0 {
-			return nil, nil, 0, fmt.Errorf("no CPU temperature")
-		}
-		c.expect = map[string]bool{}
-		for k := range temps {
-			c.expect[k] = true
-		}
-		log.Printf("temperature sensors: %s", fmtTemps(temps))
-	}
-	if c.fansSeen == nil {
-		c.fansSeen = map[string]bool{}
-		for k := range fans {
-			c.fansSeen[k] = true
-		}
-	}
-	// a reading missing for a few cycles is bridged with its last value (gapTracker)
-	if err := c.fillGaps(temps, fans, why, time.Now()); err != nil {
-		return nil, nil, 0, err
-	}
-	for k := range c.expect {
-		if _, ok := temps[k]; !ok {
-			return nil, nil, 0, fmt.Errorf("temperature %s stopped reporting", k)
-		}
-	}
-	for _, k := range requiredTemps {
-		if _, ok := temps[k]; !ok {
-			return nil, nil, 0, fmt.Errorf("required temperature %s has no reading", k)
-		}
-	}
-	// a dead, stalled or vanished fan: the iDRAC compensates with the others, we can't
-	for k := range c.fansSeen {
-		if v, ok := fans[k]; !ok || v < fanMinRPM {
-			return nil, nil, 0, fmt.Errorf("fan %s at %g rpm (missing or below FAN_MIN_RPM)", k, v)
-		}
-	}
-	for k, v := range temps {
-		if !(v > 0 && v < 127) {
-			return nil, nil, 0, fmt.Errorf("implausible %s reading %g C", k, v)
-		}
-	}
-	return temps, fans, watts, nil
-}
-
-func (c *controller) setAuto(why string) error {
-	err := c.bmc.FanAuto()
-	st.Lock()
-	if err == nil {
-		st.auto, st.duty = 1, -1
-	}
-	st.reason = why
-	st.Unlock()
-	return err
-}
-
-func fmtTemps(m map[string]float64) string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, len(keys))
-	for i, k := range keys {
-		parts[i] = fmt.Sprintf("%s=%g", k, m[k])
-	}
-	return strings.Join(parts, " ")
-}
-
-func (c *controller) step() error {
-	temps, fans, watts, err := c.readBMC()
-	if err != nil {
-		return err
-	}
-	hdds.Lock()
-	ids, hdd, hddAt, scanned := hdds.ids, hdds.temps, hdds.at, hdds.scanned
-	hdds.Unlock()
-	st.Lock()
-	st.temps, st.fans, st.hdd, st.watts, st.lastOK = temps, fans, hdd, watts, float64(time.Now().UnixMilli())/1000
-	mode, fixedPct, reason, capNow := st.mode, st.fixed, st.reason, st.powerCap
-	st.Unlock()
-
-	throttle := c.gapLevel >= 2
-	if mode != "model" && !throttle {
-		c.capSet = false
-		if capNow != 0 && capNow != int(pcapMax) { // left model mode: don't leave our cap behind
-			if err := c.bmc.SetPowerCap(int(pcapMax)); err != nil {
-				return err
-			}
-			st.Lock()
-			st.powerCap = int(pcapMax)
-			st.Unlock()
-			log.Printf("power cap lifted (%d W, mode=%s)", int(pcapMax), mode)
-		}
-	}
-	var r decision
-	ivl := interval.Seconds()
-	switch {
-	case mode == "auto":
-		r.why = "mode=auto"
-	case !scanned:
-		r.why = "scanning drives"
-	case len(ids) < hddMin:
-		r.why = fmt.Sprintf("only %d drives found (HDD_MIN %d)", len(ids), hddMin)
-	case time.Since(hddAt) > hddInterval+2*time.Minute:
-		r.why = "hdd temps stale"
-	case len(hdd) < len(ids): // can't see every drive -> don't guess
-		r.why = fmt.Sprintf("hdd temps missing (%d/%d)", len(hdd), len(ids))
-		select {
-		case c.kick <- struct{}{}: // retry the drive read now
-		default:
-		}
-	case mode == "fixed":
-		r = decide(temps, hdd, 0, false, 0) // still honor the safety limits
-		if r.ok {
-			r.target, r.why = float64(fixedPct), "fixed"
-		}
-	case mode == "model":
-		// feedforward power: RAPL reacts within a cycle; the iDRAC wall reading lags ~30 s.
-		// wall ~= RAPL + offset (fans, drives, RAM, PSU loss), learned slowly (~5 min)
-		pr, hasPr := raplWatts()
-		if hasPr && watts > 0 {
-			if !c.raplLearned {
-				c.raplOff, c.raplLearned = watts-pr, true
-			} else {
-				c.raplOff += ivl / 300 * (watts - pr - c.raplOff)
-			}
-		}
-		ff := watts
-		if hasPr && c.raplLearned {
-			ff = math.Max(watts, pr+c.raplOff)
-		}
-		r = decide(temps, hdd, ff, true, c.modelI)
-		st.Lock()
-		st.ffWatts = ff
-		st.Unlock()
-		if r.ok {
-			d, hot := r.d, hottestCPU(temps)
-			over := hot - cpuTarget
-			pinned := fanMax > 0 && d.cpu >= fanMax
-			cpuEff := d.cpu
-			if fanMax > 0 {
-				cpuEff = math.Min(d.cpu, fanMax)
-				if pinned { // CPU wants more than FAN_MAX: hold the fans there, power does the rest
-					r.target = math.Max(fanMax, math.Max(d.hdd, d.exhaust))
-					r.why = fmt.Sprintf("model (fan ceiling %.0f%%, power capped)", fanMax)
-				}
-				// cap: most power that settles at CPU_TARGET with fans at FAN_MAX, plus a correction
-				// that tightens while the CPU is still above target at the ceiling
-				h := c.hotHist
-				if pinned && over > 0 && (over >= 2 || (len(h) > 1 && h[len(h)-1] >= h[0])) {
-					c.capCorr -= kw * over * ivl / 60
-				} else if over < -2 {
-					c.capCorr = math.Min(0, c.capCorr+kw*ivl/60)
-				}
-				c.capCorr = math.Max(-150, math.Min(0, c.capCorr))
-				want := modelMaxWatts(inletOf(temps), fanMax) + c.capCorr
-				if want >= pcapMax {
-					want = pcapMax
-				} else {
-					want = math.Max(pcapMin, want)
-				}
-				if !throttle && (!c.capSet || math.Abs(want-c.lastCap) >= pcapStep || (want == pcapMax) != (c.lastCap == pcapMax)) {
-					if math.IsNaN(want) || math.IsInf(want, 0) {
-						return fmt.Errorf("power cap computed as %v", want)
-					}
-					w := int(math.Round(want))
-					if err := c.bmc.SetPowerCap(w); err != nil {
-						return err
-					}
-					c.lastCap, c.capSet = float64(w), true
-					st.Lock()
-					st.powerCap = w
-					st.Unlock()
-					log.Printf("power cap %d W (inlet %gC, correction %.0f W)", w, inletOf(temps), c.capCorr)
-				}
-			}
-			emergency := hot >= cpuLimit
-			if emergency { // past the hard line: no waiting
-				r.target, r.why = math.Max(r.target, emergencyPct), fmt.Sprintf("cpu %.0fC >= limit %.0f", hot, cpuLimit)
-			} else if c.manual && r.target < c.current { // step up at once, down <= 2%/cycle
-				r.target = math.Max(r.target, c.current-2)
-			}
-			// correction (anti-windup): only while the fans really run at the CPU's own demand, the
-			// temperature is near the target, and the duty can still move that way
-			c.hotHist = append(c.hotHist, hot)
-			if n := max(2, int(60/ivl)+1); len(c.hotHist) > n {
-				c.hotHist = c.hotHist[len(c.hotHist)-n:]
-			}
-			lo, hi := c.hotHist[0], c.hotHist[0]
-			for _, v := range c.hotHist {
-				lo, hi = math.Min(lo, v), math.Max(hi, v)
-			}
-			settled := float64(len(c.hotHist)) > 60/ivl && hi-lo <= 1
-			// ... and only while the model's own request (not the warm floor) sets the CPU demand
-			onCPU := !emergency && r.modelRan && r.modelPart >= r.warmPart && math.Abs(r.target-cpuEff) < 0.5 &&
-				cpuEff >= math.Max(d.hdd, d.exhaust)
-			if c.gapLevel == 0 && settled && onCPU && math.Abs(over) < 5 && !(d.cpu <= minPct && over < 0) && !(pinned && over > 0) {
-				c.modelI = math.Max(-iMax, math.Min(iMax, c.modelI+ki*over*ivl/60))
-			}
-			st.Lock()
-			st.modelI, st.capCorr, st.modelOn = c.modelI, c.capCorr, true
-			st.Unlock()
-		}
-	default:
-		r = decide(temps, hdd, 0, false, 0)
-		if r.ok && c.manual && r.target < c.current { // step up immediately, down at most 2%/cycle
-			r.target = math.Max(r.target, c.current-2)
-		}
-	}
-	if hot := hottestCPU(temps); r.ok && hot >= cpuLimit && r.target < emergencyPct { // every mode, incl. fixed
-		r.target, r.why = emergencyPct, fmt.Sprintf("cpu %.0fC >= limit %.0f", hot, cpuLimit)
-	}
-	if r.ok && throttle && r.target < gapFloor { // a sensor reading is still missing
-		r.target, r.why = gapFloor, "sensor reading missing"
-	}
-	if err := c.throttle(throttle); err != nil {
-		return err
-	}
-	if r.ok || r.d != (demand{}) {
-		st.Lock()
-		st.demand, st.hasDemand, st.exhExpected = r.d, true, r.exhExpected
-		st.Unlock()
-	}
-
-	if !r.ok {
-		// sent every cycle, not only on the transition: an earlier hand-back may have failed and left
-		// the BMC in manual at a low duty
-		if err := c.setAuto(r.why); err != nil {
-			return err
-		}
-		if c.manual || reason != r.why {
-			log.Printf("%sauto: %s", prWarn, r.why)
-		}
-		c.manual, c.hotHist = false, nil
-	} else if !c.manual || math.Round(r.target) != math.Round(c.current) || time.Since(c.sentAt) >= reassert {
-		// re-sent periodically: retakes the fans after an iDRAC reset
-		if math.IsNaN(r.target) || math.IsInf(r.target, 0) { // int(NaN) is undefined: could mean 0 %
-			return fmt.Errorf("duty computed as %v", r.target)
-		}
-		pct := max(0, min(100, int(math.Round(r.target))))
-		if err := c.bmc.FanDuty(pct); err != nil {
-			return err
-		}
-		if !c.manual || math.Round(r.target) != math.Round(c.current) {
-			vals := make([]string, 0, len(hdd))
-			for _, v := range hdd {
-				vals = append(vals, fmt.Sprintf("%g", v))
-			}
-			sort.Strings(vals)
-			log.Printf("duty %d%% (%s) %s hdd=[%s]", int(math.Round(r.target)), r.why, fmtTemps(temps), strings.Join(vals, " "))
-		}
-		c.current, c.manual, c.sentAt = r.target, true, time.Now()
-		st.Lock()
-		st.auto, st.duty, st.reason = 0, pct, "manual"
-		st.Unlock()
-	}
-	return nil
-}
-
-// safeStep runs one cycle; a panic (a bug, a reply the parsers didn't expect) counts as a failed
-// cycle like any other error instead of killing the process.
-func (c *controller) safeStep() (err error) {
-	defer func() {
-		if p := recover(); p != nil {
-			err = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
-		}
-	}()
-	return c.step()
-}
-
-func (c *controller) run() {
-	sdNotify("READY=1")
-	for {
-		select {
-		case apply := <-c.reload:
-			apply()
-			c.manual = false // re-send the duty under the new settings
-		default:
-		}
-		if err := c.safeStep(); err != nil { // any failure -> safe mode
-			st.Lock()
-			st.errors++
-			st.Unlock()
-			log.Printf("%serror: %v -> auto", prErr, err)
-			if err := c.setAuto("error"); err != nil {
-				log.Printf("%sfans -> iDRAC auto failed: %v", prErr, err)
-			}
-			c.manual = false
-		}
-		sdNotify("WATCHDOG=1")
-		time.Sleep(interval)
-	}
-}
-
 // hddWorker runs hddLoop and restarts it after a panic; meanwhile the drive data goes stale and
 // the control loop hands the fans to the iDRAC.
 func hddWorker(kick <-chan struct{}) {
 	for {
 		p, err := OpenPerc()
-		if err != nil { // no controller (yet): publish "no drives" (HDD_MIN decides) and retry
+		if err != nil { // no controller (yet): publish "no drives" (inputs.hdd_min decides) and retry
 			log.Printf("drives: %v (retrying in 60 s)", err)
 			hdds.Lock()
 			hdds.ids, hdds.temps, hdds.at, hdds.scanned = nil, map[Drive]float64{}, time.Now(), true
@@ -1108,7 +345,7 @@ func hddWorker(kick <-chan struct{}) {
 	}
 }
 
-// hddLoop keeps hdds fresh: every HDD_INTERVAL (or when kicked), rescanning every HDD_RESCAN.
+// hddLoop keeps hdds fresh: every inputs.hdd_interval (or when kicked), rescanning every inputs.hdd_rescan.
 func hddLoop(p *Perc, kick <-chan struct{}) {
 	var ids []Drive
 	var scanAt time.Time
@@ -1225,8 +462,21 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	line("# TYPE fanctl_duty_percent gauge\nfanctl_duty_percent %d", st.duty)
 	line("# TYPE fanctl_auto_mode gauge\nfanctl_auto_mode %d", st.auto)
-	line("# TYPE fanctl_sensor_gap_level gauge\nfanctl_sensor_gap_level %d", st.gap)
-	line("# TYPE fanctl_cpu_throttled gauge\nfanctl_cpu_throttled %d", map[bool]int{false: 0, true: 1}[st.throttled])
+	b01 := map[bool]int{false: 0, true: 1}
+	line("# TYPE fanctl_controller gauge")
+	for _, k := range []string{"model", "fixed", "safe", "shutdown", "idrac"} {
+		line(`fanctl_controller{controller="%s"} %d`, k, b01[st.state == k])
+	}
+	line("# TYPE fanctl_cpu_clamped gauge\nfanctl_cpu_clamped %d", b01[st.clamped])
+	line("# TYPE fanctl_input_age_seconds gauge")
+	ak := make([]string, 0, len(st.ages))
+	for k := range st.ages {
+		ak = append(ak, k)
+	}
+	sort.Strings(ak)
+	for _, k := range ak {
+		line(`fanctl_input_age_seconds{input="%s"} %.0f`, lbl(k), st.ages[k])
+	}
 	line("# TYPE fanctl_errors_total counter\nfanctl_errors_total %d", st.errors)
 	line("# TYPE fanctl_last_read_timestamp_seconds gauge\nfanctl_last_read_timestamp_seconds %.3f", st.lastOK)
 	line(`fanctl_info{mode="%s",reason="%s"} 1`, lbl(st.mode), lbl(st.reason))
@@ -1243,18 +493,21 @@ func control(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := q.Get("mode")
+	if mode == "auto" {
+		mode = "idrac"
+	}
 	switch mode {
-	case "curve", "auto", "fixed", "model":
+	case "model", "fixed", "idrac":
 	default:
-		http.Error(w, "mode must be curve, auto, fixed or model", http.StatusBadRequest)
+		http.Error(w, "mode must be model, fixed or idrac", http.StatusBadRequest)
 		return
 	}
 	st.Lock()
 	defer st.Unlock()
 	if mode == "fixed" {
 		pct, err := strconv.Atoi(q.Get("pct"))
-		if err != nil || pct < 5 || pct > 100 {
-			http.Error(w, "fixed needs pct=5..100", http.StatusBadRequest)
+		if err != nil || pct < 0 || pct > 100 {
+			http.Error(w, "fixed needs pct=0..100", http.StatusBadRequest)
 			return
 		}
 		st.fixed = pct
@@ -1296,14 +549,30 @@ func fansToIDRAC(bmc *BMC) error {
 // seconds). It's honoured once and only within handoffMaxAge, so a later crash still hands back.
 const handoffFile, handoffMaxAge = "/run/fanctl-handoff", time.Minute
 
+// handoffFresh: a new fanctl is about to take over (handoffFile younger than handoffMaxAge).
+func handoffFresh() (bool, time.Duration) {
+	fi, err := os.Stat(handoffFile)
+	if err != nil {
+		return false, 0
+	}
+	age := time.Since(fi.ModTime())
+	return age >= 0 && age < handoffMaxAge, age
+}
+
+// cmdAuto: no controller from here on. CPU clamp undone, fans to the iDRAC (unless a restart is
+// handing over), power cap lifted to power.cap_max. Reads nothing else: a bad config file must never
+// block the hand-back.
 func cmdAuto() {
-	undoLeftClamp()
-	if fi, err := os.Stat(handoffFile); err == nil {
-		os.Remove(handoffFile)
-		if age := time.Since(fi.ModTime()); age >= 0 && age < handoffMaxAge {
-			log.Printf("%s is %.0fs old: leaving the fans for the restarting fanctl", handoffFile, age.Seconds())
-			return
-		}
+	if restored, err := clampOff(); err != nil {
+		log.Printf("%sCPU clamp restore failed: %v", prErr, err)
+	} else if restored {
+		log.Print("CPU clamp off")
+	}
+	fresh, age := handoffFresh()
+	os.Remove(handoffFile) // honoured once: the last step of a stop
+	if fresh {
+		log.Printf("%s is %.0fs old: leaving the fans for the restarting fanctl", handoffFile, age.Seconds())
+		return
 	}
 	bmc, err := OpenBMC()
 	for deadline := time.Now().Add(30 * time.Second); err != nil && time.Now().Before(deadline); { // early boot
@@ -1312,6 +581,13 @@ func cmdAuto() {
 	}
 	if err == nil {
 		err = fansToIDRAC(bmc)
+		if w := capMaxForAuto(); w <= 0 {
+			log.Printf("%spower cap not lifted: power.cap_max %d", prErr, w)
+		} else if cerr := bmc.SetPowerCap(w); cerr != nil {
+			log.Printf("%spower cap %d W failed: %v", prErr, w, cerr)
+		} else {
+			log.Printf("power cap %d W", w)
+		}
 	}
 	if err != nil {
 		log.Fatalf("fans -> iDRAC auto: %v", err)
@@ -1407,25 +683,28 @@ func main() {
 	case "prepare":
 		cmdPrepare()
 		return
-	case "check": // validate the settings in the environment (used by reload); exits 1 if refused
-		loadConfig()
-		fmt.Println("config ok")
+	case "check": // validate a config file ("-" = stdin; used by reload); exits 1 if refused
+		path := configPath()
+		if len(os.Args) > 2 {
+			path = os.Args[2]
+		}
+		cmdCheck(path)
 		return
 	case "run":
 	default:
-		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe|prepare|check]")
+		fmt.Fprintln(os.Stderr, "usage: fanctl [run|auto|probe|prepare|check [file|-]]")
 		os.Exit(2)
 	}
 
 	loadConfig()
+	controlToken = readToken()
 	st.mode, st.fixed = mode0, fixedPct0
-	fileKeys, _ = readEnvFile(envFilePath()) // systemd already loaded it; remember which keys it set
 	bmc, err := OpenBMC()
 	if err != nil {
 		log.Fatal(err)
 	}
-	undoLeftClamp()
-	c := &controller{bmc: bmc, kick: make(chan struct{}, 1), reload: make(chan func(), 1)}
+	c := newController(bmc)
+	c.loadState()
 
 	// SIGUSR2 (systemctl kill -s USR2 fanctl): replace this process with the binary at the same path, e.g.
 	// after installing a new version. Same PID, never stopped, so the fans keep their duty and stay out of
@@ -1471,6 +750,11 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sig
+		if fresh, age := handoffFresh(); fresh { // restart: the new fanctl takes the fans over at their duty
+			bmc.mu.Lock()
+			log.Printf("%s is %.0fs old: leaving the fans for the restarting fanctl", handoffFile, age.Seconds())
+			os.Exit(0)
+		}
 		err := fansToIDRAC(bmc)
 		bmc.mu.Lock() // held until exit: the control loop can't send another duty after the hand-back
 		if err != nil {

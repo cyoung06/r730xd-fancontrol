@@ -350,9 +350,8 @@ func (b *BMC) Sensors() ([]Sensor, error) {
 	return out, nil
 }
 
-// Reading returns the converted value, or ok=false when the BMC has no reading for the sensor
-// (absent device, scanning disabled) - those are skipped, like ipmitool's "no reading".
-// Reading returns a sensor's value; ok=false with why (the BMC's answer) when there is no reading.
+// Reading returns the converted value, or ok=false with why (the BMC's answer: completion code,
+// reading unavailable, scanning disabled) when the BMC has no reading for the sensor.
 func (b *BMC) Reading(s Sensor) (v float64, ok bool, why string, err error) {
 	cc, d, err := b.Raw(s.LUN, 0x04, 0x2d, []byte{s.Num})
 	if err != nil {

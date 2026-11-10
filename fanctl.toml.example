@@ -1,0 +1,63 @@
+# fanctl settings: /etc/fanctl.toml. Every key with its default; delete what you don't change.
+# After editing: sudo systemctl reload fanctl (validated first; a refused file keeps the running
+# settings). Unknown keys are refused.
+
+mode = "model"                 # model | fixed | idrac ("auto" = idrac)
+
+[shutdown]                     # danger: at/above -> orderly poweroff, in every mode
+cpu     = 85                   # hottest CPU package (coretemp)
+hdd     = 50                   # hottest drive
+exhaust = 65
+
+[safe]                         # any input unknown (never seen, or inputs.unknown_after past due)
+duty  = 20
+cap   = 230                    # iDRAC power cap, W
+clamp = true                   # CPUs at their lowest frequency, no turbo (intel_pstate)
+
+[model]
+min_duty       = 10
+fan_max        = 0             # 0 = no cap management; else the CPU part of the duty stops here and the
+                               # iDRAC power cap holds cpu_target instead
+cpu_target     = 75
+margin         = 3             # the model aims this far below cpu_target; the correction trims
+cpu_limit      = 78            # at/above: emergency_duty at once
+emergency_duty = 50            # <= 50: the model never sends more
+ki             = 1.0           # correction, % per C per minute
+i_max          = 15            # correction limit, +/- %
+warm_curve     = [[68, 10], [72, 15], [76, 20]]   # fan floor as the hottest CPU warms
+hdd_curve      = [[38, 10], [41, 20], [44, 35], [47, 50]]
+# expected exhaust = inlet + a*(cpu - inlet) + b*(hdd - inlet); the excess over it (C) -> duty
+exhaust_model        = [0.3716, 0.1911]
+exhaust_excess_curve = [[3, 10], [5, 20], [7, 40]]
+cpu_curve      = [[55, 10], [62, 15], [68, 25], [74, 40], [80, 60]]   # only without a power reading
+exhaust_curve  = [[38, 10], [42, 25], [46, 45]]                       # only without a drive reading
+# per CPU: [pb, r0, k, n, scale] of T_cpu = T_inlet + (P - pb) * (r0 + k*(rpm/1000)^-n) * scale
+# (fitted on one machine: see "The model")
+cpu_models     = [[58.6228, 0.1107, 0.6588, 1.4572, 0.9565], [89.5481, 0.1445, 1.1485, 1.8038, 1.0562]]
+fan_rpm_table  = [[10, 3270], [15, 4060], [20, 4790], [25, 5560], [30, 6430]]   # duty -> rpm
+
+[fixed]
+duty        = 20               # 0-100, sent as is
+cpu_max     = 0                # a reading at/above -> model, for good; 0 = the [shutdown] line - 3
+hdd_max     = 0
+exhaust_max = 0
+
+[power]
+cap_min  = 230                 # never cap below (W)
+cap_max  = 586                 # "no cap": the iDRAC's highest accepted limit
+cap_step = 6                   # re-send the cap only when it moves this much (W)
+kw       = 8                   # cap correction, W per C per minute
+
+[inputs]
+required_temps = ["CPU1", "Inlet", "Exhaust"]   # never seen -> unknown
+hdd_min        = 0             # fewer drives visible -> unknown
+fan_min_rpm    = 1000          # a fan below this (dead, stalled) -> unknown
+interval       = "5s"          # 1-10 s (systemd watchdog: 60 s)
+hdd_interval   = "300s"
+hdd_rescan     = "600s"        # look for inserted/removed drives
+reassert       = "60s"         # re-send the duty this often (retakes the fans after an iDRAC reset)
+unknown_after  = "15s"         # past due -> unknown
+
+[http]
+listen     = ["127.0.0.1:9101"]
+token_file = ""                # a file holding the /control token; empty = /control disabled

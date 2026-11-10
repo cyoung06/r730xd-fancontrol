@@ -5,12 +5,11 @@ After=fanctl-failsafe.service
 
 [Service]
 Type=notify
-# '-': a missing file must not also block ExecStopPost (the hand-back)
-EnvironmentFile=-/etc/fanctl.env
+# settings: /etc/fanctl.toml (read by fanctl itself; fanctl auto reads only power.cap_max, leniently)
 # create the PERC ioctl node (the driver doesn't), outside the sandbox
 ExecStartPre=-+/usr/local/bin/fanctl prepare
 ExecStart=/usr/local/bin/fanctl
-# re-read /etc/fanctl.env without a restart (the fans stay under fanctl; a bad file is refused)
+# re-read /etc/fanctl.toml without a restart (the fans stay under fanctl; a bad file is refused)
 ExecReload=/bin/kill -HUP $MAINPID
 # runs after every stop, crash or watchdog kill: fans back to the iDRAC
 ExecStopPost=/usr/local/bin/fanctl auto

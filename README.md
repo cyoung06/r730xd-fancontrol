@@ -10,31 +10,38 @@ needs no `ipmitool`, `smartctl`, Python or containers. It also exports Prometheu
 
 ## How it works
 
-Every `INTERVAL` seconds fanctl reads the inlet, exhaust and CPU temperatures, fan RPM and wall
-power from the BMC. Drive temperatures come through the PERC every `HDD_INTERVAL` seconds, on their
+Every `inputs.interval` seconds fanctl reads the inlet, exhaust and CPU temperatures, fan RPM and wall
+power from the BMC. Drive temperatures come through the PERC every `inputs.hdd_interval` seconds, on their
 own thread. It then picks a duty and sets it with Dell's OEM fan command (`0x30 0x30`).
 
-Modes (`MODE`):
+Modes (`mode`):
 
 | mode    | duty |
 |---------|------|
-| `model` | lowest duty that settles the hottest CPU at `CPU_TARGET`, from a fitted thermal model (below) |
-| `curve` | highest of three temperature curves: CPU, hottest drive, exhaust |
-| `fixed` | `FIXED_PCT` (the safety limits still apply) |
-| `auto`  | iDRAC automatic control |
+| `model` | power first (the cap holds the CPUs at `model.cpu_target` with the fans at `model.fan_max`), then the fans: drive and exhaust demand, never above 50 %. Without a power reading it uses the temperature curves |
+| `fixed` | `fixed.duty`, any value 0-100 %. A reading at its `fixed.*_max` hands over to `model` for good (until fixed is chosen again) |
+| `idrac` | iDRAC automatic control (`auto` is accepted as the same) |
+
+Whatever the mode, an unknown input selects the safe controller and a reading in danger shuts the
+server down (see Fail-safe).
 
 ### Changing settings without a restart
 
-Edit `/etc/fanctl.env`, then `sudo systemctl reload fanctl`. fanctl re-reads the file, has `fanctl check`
-validate it in a subprocess, and swaps the settings in between two control cycles, so the fans never pass
-through the iDRAC. A refused file is logged and the running settings stay. `MODE`/`FIXED_PCT` from the file
-replace a choice made through `/control`; `LISTEN` and `CONTROL_TOKEN` still need a restart.
+Edit `/etc/fanctl.toml`, then `sudo systemctl reload fanctl`. fanctl reads the file once, has a
+`fanctl check -` subprocess validate exactly those bytes, and swaps the settings in between two control
+cycles, so the fans never pass through the iDRAC. A refused file (a bad value, or an unknown key) is
+logged and the running settings stay. `mode` / `fixed.duty` from the file replace a choice made through
+`/control`; `http.listen` and `http.token_file` still need a restart. `fanctl check [file]` validates a
+file by hand.
 
 New binary: install it over `/usr/local/bin/fanctl`, then `sudo systemctl kill -s USR2 fanctl`. fanctl
 re-execs itself in place (same PID), so the fans keep their duty instead of passing through the iDRAC.
 
-To restart anyway without the hand-back (e.g. from a version without USR2): `sudo touch /run/fanctl-handoff`
-within a minute before the stop makes the following `fanctl auto` leave the fans alone, once.
+To restart anyway without the hand-back (e.g. a unit-file change, which USR2 doesn't apply):
+`sudo touch /run/fanctl-handoff` within a minute before the stop makes both the stopping fanctl and the
+following `fanctl auto` leave the fans alone, once.
+
+A running sensor gap survives a restart or re-exec (see Fail-safe: `/run/fanctl/inputs.json`).
 
 ### The exhaust model (all modes with drive readings)
 
@@ -48,13 +55,13 @@ T_exh_expected = T_inlet + a * (T_cpu - T_inlet) + b * (T_hdd - T_inlet)      (h
 
 The exhaust is a mix of inlet air and air warmed by each part, so `a, b >= 0` and `a + b < 1`, with no
 constant term. Fan speed drops out: faster fans take more heat off a part but spread it through
-proportionally more air. `EXHAUST_EXCESS_CURVE` turns the excess (measured minus expected) into a duty,
-so the exhaust only raises the fans for heat the sensors don't account for. `EXHAUST_AUTO` still applies
-to the absolute exhaust, and a cycle without a drive reading uses the absolute `EXHAUST_CURVE`. The
+proportionally more air. `model.exhaust_excess_curve` turns the excess (measured minus expected) into a duty,
+so the exhaust only raises the fans for heat the sensors don't account for. `shutdown.exhaust` still applies
+to the absolute exhaust, and a cycle without a drive reading uses the absolute `model.exhaust_curve`. The
 default `a, b` (0.3716, 0.1911) were fitted on 8 days of steady data from my R730xd (rmse 1.2 C); refit
 for another machine.
 
-### The thermal model (`MODE=model`)
+### The thermal model (`mode = "model"`)
 
 The steady-state CPU temperature is modelled per socket as
 
@@ -66,49 +73,63 @@ T_cpu = T_inlet + (P - pb) * (r0 + k * (rpm/1000)^-n) * scale
 - `pb` is the share of that power that doesn't heat the CPU.
 - `r0 + k·rpm^-n` is the CPU-to-air thermal resistance, which falls as airflow rises.
 
-fanctl inverts this model to get the fan RPM, and from that the duty, that holds `CPU_TARGET - MODEL_MARGIN`.
+fanctl inverts this model to get the fan RPM, and from that the duty, that holds `model.cpu_target - model.margin`.
 
 - **Feedforward from RAPL:** the iDRAC power reading lags by about 30 s. RAPL package power reacts within one cycle, so fanctl uses `max(wall, RAPL + learned offset)`.
 - **Integral correction:** a slow correction trims model error (dust, room, drive layout). It only integrates when the temperature has settled and the model is in control, so it can't wind up.
-- **Warm floor:** `WARM_CURVE` sets a minimum duty that rises as the CPU warms, which keeps headroom for a sudden load step.
+- **Warm floor:** `model.warm_curve` sets a minimum duty that rises as the CPU warms, which keeps headroom for a sudden load step.
 - **Fan ceiling and power cap:**
-  - The CPU never pushes the fans past `FAN_MAX`.
-  - Instead, the DCMI power limit is set to the most power that still holds `CPU_TARGET` at `FAN_MAX`, plus a correction that tightens while the CPU stays above target.
-  - The cap is verified by reading it back. It is never deactivated, because on iDRAC8 a later activate silently fails, so "no cap" is `PCAP_MAX` (586 W).
-  - The exception action is forced to "no action" (never a hard power-off), and leaving model mode lifts the cap back to `PCAP_MAX`.
-- **Emergency:** at `CPU_LIMIT` the fans jump to `EMERGENCY_PCT` at once. Above that, the `*_AUTO` limits hand control to the iDRAC.
+  - The CPU never pushes the fans past `model.fan_max`.
+  - Instead, the DCMI power limit is set to the most power that still holds `model.cpu_target` at `model.fan_max`, plus a correction that tightens while the CPU stays above target.
+  - The cap is verified by reading it back. It is never deactivated, because on iDRAC8 a later activate silently fails, so "no cap" is `power.cap_max` (586 W).
+  - The exception action is forced to "no action" (never a hard power-off), and leaving model mode lifts the cap back to `power.cap_max`.
+- **Emergency:** at `model.cpu_limit` the fans jump to `model.emergency_duty` at once. At the `[shutdown]` lines the server shuts down (Fail-safe).
 
 > **The default model parameters were fitted on one specific machine.** That's my R730xd, with
 > its CPUs, heatsinks, drive layout and blanks, from a 12-hour fan% × power-cap benchmark. Your box
-> will differ. Start with `MODE=curve`, or keep `MODEL_MARGIN` generous and watch the
-> `fanctl_model_correction_percent` metric. A correction pinned at ±`MODEL_I_MAX` means the model
-> doesn't fit your machine. `FAN_RPM_TABLE` (duty:RPM at fixed duty) is also machine-specific.
+> will differ. Keep `model.margin` generous (without `model.fan_max` and a power reading the model runs on its curves) and watch the
+> `fanctl_model_correction_percent` metric. A correction pinned at ±`model.i_max` means the model
+> doesn't fit your machine. `model.fan_rpm_table` (duty:RPM at fixed duty) is also machine-specific.
 
 ## Fail-safe
 
-The fans must never be left low while nothing is watching. Every failure path ends with the iDRAC
-in control:
+Errors are data, not branches. Each cycle: **sense → classify → pick → control → act**.
 
-| failure | what happens |
+- **Sense.** CPU1/CPU2 come from the CPUs' own package sensors through the kernel (coretemp,
+  `Package id 0/1`), not the iDRAC: the same sensors without the iDRAC's dropouts, ~1 °C lower.
+  Inlet, exhaust, fans and wall power come from the BMC, drives from the PERC. Every input is a value
+  plus when it last read valid; a failed, timed-out, implausible or "unavailable" read changes
+  nothing, the input just gets older. Each one is logged with the source's answer.
+- **Classify.** Each input (each temperature, fan and drive, the drive count against `inputs.hdd_min`, and
+  each actuator: duty, power cap, CPU clamp) is **ok**, **unknown** or **danger**:
+  - unknown: never seen this run, or 15 s past its due time (5 s inputs: the 3rd missed read, 20 s
+    after the last good one; drives: 15 s after a missed `inputs.hdd_interval` read); a fan below
+    `inputs.fan_min_rpm`; an actuator whose writes have failed for 15 s. Until then the last value stands in.
+  - danger: CPU ≥ `shutdown.cpu`, drive ≥ `shutdown.hdd`, exhaust ≥ `shutdown.exhaust` (inlet has no line).
+- **Pick.** The worst class: danger → **shutdown** (any mode); mode `idrac` → **idrac**; unknown →
+  **safe**; otherwise the mode's controller (**model** or **fixed**).
+- **Control.** safe: 20 % fans, CPUs at minimum power (turbo off and `intel_pstate` `max_perf_pct` =
+  min, since RAPL is locked by the BIOS; iDRAC cap at `safe.cap`, all from `[safe]`); held a full CPU load with falling
+  temperatures. shutdown: the safe outputs plus a clean OS poweroff (`systemctl poweroff`), once.
+- **Act.** Each actuator is written only when it differs from what it last confirmed.
+
+A panic or an impossible value (NaN) in classify, pick or a controller → the safe controller. Inputs
+and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart continues a running gap.
+
+| situation | what happens |
 |---|---|
-| sensor read fails, BMC times out | fans → iDRAC auto, retried next cycle |
-| a temperature or fan reading goes missing | last reading reused (warning logged each read); after 20 s also duty ≥ 25 %, CPUs clamped to their lowest frequency (turbo off, `intel_pstate` `max_perf_pct` = min) and iDRAC power cap at `PCAP_MIN`, error logged each read, until it reports again. A sensor never seen with a value → iDRAC auto. Both throttles failing → iDRAC auto. (`fanctl_sensor_gap_level` 1/2, `fanctl_cpu_throttled`) |
-| a `REQUIRED_TEMPS` sensor has no reading, or one reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
-| a fan disappears or drops below `FAN_MIN_RPM` | fans → iDRAC auto (it compensates with the others) |
-| fewer than `HDD_MIN` drives visible; a drive missing from one rescan | fans → iDRAC auto (a shrink is accepted only when the next scan agrees) |
-| a hand-back to the iDRAC fails | re-sent every cycle until it succeeds |
-| CPU ≥ `CPU_LIMIT` in any mode (incl. `fixed`) | duty ≥ `EMERGENCY_PCT` |
-| duty or power cap computes to NaN/Inf | fans → iDRAC auto |
-| invalid settings (e.g. `INTERVAL` > 10 s, `FAN_MAX` > 100, limits out of order, non-finite model values) | refuses to start; fans stay with the iDRAC |
-| a known drive stops reporting, drive data stale | fans → iDRAC auto |
-| panic in a control cycle (bug, unexpected BMC reply) | recovered: fans → iDRAC auto, next cycle retries |
-| panic in the drive reader | recovered and restarted; stale drive data → iDRAC auto meanwhile |
-| CPU ≥ `CPU_AUTO`, drive ≥ `HDD_AUTO`, exhaust ≥ `EXHAUST_AUTO` | fans → iDRAC auto |
-| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` (retries for up to 12 s) also undoes a CPU clamp (saved in `/run/fanctl/throttle`), restart after 5 s |
+| a reading missing, timed out, implausible, "unavailable"; the BMC not answering | last value for 15 s past due, then safe (`fanctl_input_age_seconds`, `fanctl_controller`, `fanctl_cpu_clamped`) |
+| drive temperature missing, fewer than `inputs.hdd_min` drives, the PERC unreachable | same, on the drives' own period; a drive missing from one rescan stays expected until the next scan agrees |
+| a required sensor never seen this run | unknown at once → safe |
+| a fan below `inputs.fan_min_rpm`; duty, cap or clamp writes failing for 15 s | unknown → safe |
+| a reading at its `[shutdown]` line | danger → orderly shutdown |
+| CPU ≥ `model.cpu_limit` in `model` | duty ≥ `model.emergency_duty` |
+| invalid settings (e.g. `inputs.interval` > 10 s, limits out of order, non-finite model values) | refuses to start; fans stay with the iDRAC |
+| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto`: CPU clamp undone, fans → iDRAC auto (retries for up to 12 s), power cap → `power.cap_max`; restart after 5 s |
 | control loop hangs | systemd `WatchdogSec=60` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |
-| iDRAC reset | fanctl re-sends its duty every `REASSERT` s and takes the fans back |
+| iDRAC reset | fanctl re-sends its duty every `inputs.reassert` s and takes the fans back |
 
 ## Requirements
 
@@ -131,7 +152,8 @@ it finds. Compare them with `ipmitool sdr` before going further.
 
 ```sh
 sudo install -m 755 fanctl /usr/local/bin/fanctl
-sudo install -m 600 fanctl.env.example /etc/fanctl.env    # then edit it
+sudo install -m 644 fanctl.toml.example /etc/fanctl.toml  # then edit it; fanctl check validates it
+(umask 077; openssl rand -hex 16 | sudo tee /etc/fanctl.token >/dev/null)   # optional: enables /control
 sudo install -m 644 systemd/fanctl.service systemd/fanctl-failsafe.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable fanctl-failsafe.service
@@ -153,13 +175,14 @@ sudo systemctl daemon-reexec
 ## Usage
 
 ```
-fanctl [run]   control loop (settings from the environment / /etc/fanctl.env)
+fanctl [run]   control loop (settings: /etc/fanctl.toml, or $FANCTL_CONFIG)
+fanctl check [file|-]  validate a config file; exit 1 if refused
 fanctl auto    hand the fans back to the iDRAC and exit
 fanctl probe   print every reading fanctl uses; changes nothing
 fanctl prepare create /dev/megaraid_sas_ioctl_node if missing (the driver doesn't; the unit runs this)
 ```
 
-Runtime mode switch, when `CONTROL_TOKEN` is set:
+Runtime mode switch, when `http.token_file` holds a token:
 
 ```
 curl 'http://127.0.0.1:9101/control?token=...&mode=fixed&pct=30'
@@ -168,31 +191,19 @@ curl 'http://127.0.0.1:9101/control?token=...&mode=model'
 
 ## Settings
 
-All settings go in `/etc/fanctl.env`; see [`fanctl.env.example`](fanctl.env.example) for the
-annotated defaults. The main ones:
+All settings go in `/etc/fanctl.toml`, one section per controller; see
+[`fanctl.toml.example`](fanctl.toml.example) for every key with its default. Unknown keys are refused.
 
-| variable | default | |
-|---|---|---|
-| `MODE` | `curve` | `model`, `curve`, `fixed`, `auto` |
-| `MIN_PCT` | `10` | duty floor |
-| `CPU_TARGET` / `MODEL_MARGIN` | `75` / `3` | model mode: target; the model aims this far below |
-| `CPU_LIMIT` / `EMERGENCY_PCT` | `78` / `50` | jump straight to this duty at the limit |
-| `FAN_MAX` | `0` | fan ceiling for the CPU part; caps power instead (0 = off) |
-| `PCAP_MIN` / `PCAP_MAX` | `230` / `586` | power cap range (W); `PCAP_MAX` = "no cap" |
-| `WARM_CURVE` | `68:10,72:15,76:20` | model mode: duty floor vs hottest CPU |
-| `CPU_CURVE`, `HDD_CURVE`, `EXHAUST_CURVE` | | `temp:duty,...` |
-| `EXHAUST_MODEL` | `0.3716,0.1911` | `a,b` of the expected exhaust (above) |
-| `EXHAUST_EXCESS_CURVE` | `3:10,5:20,7:40` | `excess C:duty,...`; replaces `EXHAUST_CURVE` while drive temperatures are read |
-| `CPU_AUTO`, `HDD_AUTO`, `EXHAUST_AUTO` | `85`, `50`, `50` | hand over to the iDRAC at/above |
-| `CPU1_MODEL`, `CPU2_MODEL` | fitted | `pb,r0,k,n,scale` |
-| `REQUIRED_TEMPS` | `CPU1,Inlet,Exhaust` | must read every cycle |
-| `HDD_MIN` | `0` | drives that must be visible |
-| `FAN_MIN_RPM` | `1000` | dead/stalled fan threshold |
-| `FAN_RPM_TABLE` | `10:3270,...,30:6430` | measured RPM at fixed duty |
-| `INTERVAL` / `HDD_INTERVAL` / `HDD_RESCAN` | `10` / `300` / `600` | seconds (`INTERVAL` ≤ 10) |
-| `REASSERT` | `60` | re-send the duty this often (s) |
-| `LISTEN` | `127.0.0.1:9101` | comma-separated listen addresses |
-| `CONTROL_TOKEN` | empty | enables `/control` |
+| section | keys |
+|---|---|
+| top level | `mode`: `model`, `fixed`, `idrac` (`auto` = `idrac`) |
+| `[shutdown]` | `cpu`, `hdd`, `exhaust`: danger lines, orderly poweroff at/above |
+| `[safe]` | `duty`, `cap` (W), `clamp`: what an unknown input gets |
+| `[model]` | `min_duty`, `fan_max`, `cpu_target`, `margin`, `cpu_limit`, `emergency_duty`, `ki`, `i_max`, the curves (`[[temp, duty], ...]`), `exhaust_model`, `cpu_models`, `fan_rpm_table` |
+| `[fixed]` | `duty` (0-100), `cpu_max` / `hdd_max` / `exhaust_max`: hand over to model at/above (0 = shutdown line − 3) |
+| `[power]` | `cap_min`, `cap_max` ("no cap"), `cap_step`, `kw` |
+| `[inputs]` | `required_temps`, `hdd_min`, `fan_min_rpm`, `interval` (≤ 10 s), `hdd_interval`, `hdd_rescan`, `reassert`, `unknown_after` (durations: `"5s"`) |
+| `[http]` | `listen` (list), `token_file`: the `/control` token, kept out of this file |
 
 ## Metrics
 
@@ -200,13 +211,16 @@ annotated defaults. The main ones:
 
 | metric | |
 |---|---|
-| `fanctl_temperature_celsius{sensor}` | BMC temperatures |
+| `fanctl_temperature_celsius{sensor}` | temperatures (CPU1/CPU2 from coretemp, the rest from the BMC) |
 | `fanctl_fan_rpm{fan}` | fan speeds |
 | `fanctl_hdd_temperature_celsius{id,serial}` | drive temperatures |
 | `fanctl_power_watts` | wall power |
 | `fanctl_feedforward_watts` | power used by the model (RAPL feedforward) |
 | `fanctl_duty_percent` | duty sent (`-1` in auto) |
 | `fanctl_auto_mode` | 1 = the iDRAC is in control |
+| `fanctl_controller{controller}` | 1 for the controller that ran last: model, fixed, safe, shutdown, idrac |
+| `fanctl_cpu_clamped` | 1 = CPUs at their lowest frequency |
+| `fanctl_input_age_seconds{input}` | seconds since each input last read valid |
 | `fanctl_demand_percent{source}` | what each of cpu/hdd/exhaust asks for |
 | `fanctl_model_correction_percent` | integral correction |
 | `fanctl_power_cap_watts` | iDRAC power cap |
