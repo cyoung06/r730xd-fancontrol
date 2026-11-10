@@ -51,12 +51,3 @@ unknown_after = "15s"
 		t.Fatalf("safe %g %g %v fan_max %g warm %v", safeDuty, safeCap, safeClamp, fanMax, warmCurve)
 	}
 }
-
-// safe.cap must be whole watts: the iDRAC reads back whole watts, so 230.5 could never be confirmed.
-func TestConfigSafeCapWhole(t *testing.T) {
-	c, err := parseConfig([]byte("[safe]\ncap = 230.5\n"))
-	if err != nil || c.Safe.Cap != 230.5 {
-		t.Fatal(err)
-	}
-	// apply() exits on a refused config; the check subprocess is how that is tested (see reload_full_test)
-}

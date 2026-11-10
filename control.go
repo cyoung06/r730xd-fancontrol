@@ -140,7 +140,7 @@ type controller struct {
 	safeOK           time.Time            // safe: last cycle its readbacks matched (or it was entered)
 	danger           map[string]dangerRun // readings at/above their shutdown line, confirming
 	lastKick         time.Time            // last early drive re-read asked for
-	capWritten       bool                 // the cap was written: read it back next cycle
+	shutdownTried    bool                 // the shutdown's best-effort writes were tried once
 	off              *desired             // the shutdown decided: it stays (latched)
 	bmcDown          bool                 // the BMC didn't answer this cycle
 
@@ -210,17 +210,17 @@ func (c *controller) sense(now time.Time) {
 		}
 		log.Printf("temperature sensors: %s; fans: %d", fmtTemps(temps), len(fans))
 	}
-	for k := range c.in.Temps {
-		if v, ok := temps[k]; ok {
-			c.in.Temps[k] = input{v, now}
-		}
-	}
 	// required_temps follow the config (also after a reload, or state carried over from a run with
 	// other settings): a required one is expected even unseen. Only a key never seen can go, so a
 	// sensor fanctl discovered stays expected whatever required_temps says.
 	for _, k := range requiredTemps {
 		if _, ok := c.in.Temps[k]; !ok {
 			c.in.Temps[k] = input{}
+		}
+	}
+	for k := range c.in.Temps {
+		if v, ok := temps[k]; ok {
+			c.in.Temps[k] = input{v, now}
 		}
 	}
 	for k, in := range c.in.Temps {
@@ -233,10 +233,9 @@ func (c *controller) sense(now time.Time) {
 			c.in.Fans[k] = input{v, now}
 		}
 	}
-	// the cap is read back every inputs.reassert and the cycle after a write (a hung BMC costs one
-	// timeout per cycle, not two)
-	if !c.bmcDown && (c.capWritten || now.Sub(c.in.Cap.Seen) >= reassert) {
-		c.capWritten = false
+	// the cap is read back every inputs.reassert (a write verifies it too, see act); a hung BMC
+	// costs one timeout per cycle, not two
+	if !c.bmcDown && now.Sub(c.in.Cap.Seen) >= reassert {
 		if pl, err := c.bmc.GetPowerLimit(); err == nil {
 			w := float64(pl.Watts)
 			if !pl.Active {
@@ -893,6 +892,10 @@ func (c *controller) normal(temps, hdd map[string]float64, watts float64) (decis
 // retakes the fans after an iDRAC reset). The clamp goes first: it is local, so it works even when
 // the BMC doesn't.
 func (c *controller) act(d desired, now time.Time) {
+	if d.off {
+		c.actShutdown(d)
+		return
+	}
 	want := map[bool]string{false: "off", true: "on"}[d.clamp]
 	var err error
 	if d.clamp {
@@ -911,12 +914,12 @@ func (c *controller) act(d desired, now time.Time) {
 	}
 	c.clamp.result(want, err, now)
 
-	if w := strconv.Itoa(d.cap); c.pcap.have != w || (!c.in.Cap.Seen.IsZero() && !c.capWritten && c.in.Cap.V != float64(d.cap)) {
-		err := c.bmc.SetPowerCap(d.cap)
-		c.capWritten = true // read it back next cycle
+	if w := strconv.Itoa(d.cap); c.pcap.have != w || (!c.in.Cap.Seen.IsZero() && c.in.Cap.V != float64(d.cap)) {
+		err := c.bmc.SetPowerCap(d.cap) // reads the limit back and fails unless it took
 		if err != nil {
 			log.Printf("%spower cap %d W failed: %v", prErr, d.cap, err)
 		} else {
+			c.in.Cap = input{float64(d.cap), now} // that read-back
 			log.Printf("power cap %d W (%s)", d.cap, d.why)
 		}
 		c.pcap.result(w, err, now)
@@ -944,14 +947,6 @@ func (c *controller) act(d desired, now time.Time) {
 			c.duty, _ = strconv.ParseFloat(d.fan, 64) // the down-ramp starts from what was really sent ("auto": 0)
 		}
 	}
-	if d.off && !c.poweredOff {
-		log.Printf("%sSHUTDOWN: %s", prErr, d.why)
-		if err := poweroff(); err != nil {
-			log.Printf("%spoweroff failed: %v (retrying next cycle)", prErr, err)
-		} else {
-			c.poweredOff = true
-		}
-	}
 	if d.state != c.last.state || (d.state == "safe" && d.why != c.last.why) {
 		pr := prWarn
 		if d.state == "safe" || d.state == "shutdown" {
@@ -972,6 +967,32 @@ func (c *controller) act(d desired, now time.Time) {
 		st.powerCap = p
 	}
 	st.reason, st.state, st.clamped = d.why, d.state, c.clamp.have == "on"
+	st.Unlock()
+}
+
+// actShutdown: the poweroff first, so nothing after it can delay or stop it; then, once, the fans to
+// the iDRAC and the CPUs to minimum power, failures ignored (the machine is going down).
+func (c *controller) actShutdown(d desired) {
+	if !c.poweredOff {
+		log.Printf("%sSHUTDOWN: %s", prErr, d.why)
+		if err := poweroff(); err != nil {
+			log.Printf("%spoweroff failed: %v (retrying next cycle)", prErr, err)
+		} else {
+			c.poweredOff = true
+		}
+	}
+	if !c.shutdownTried {
+		c.shutdownTried = true
+		try("shutdown: fans to the iDRAC", func() { _ = c.bmc.FanAuto() })
+		try("shutdown: power cap", func() { _ = c.bmc.SetPowerCap(d.cap) })
+		try("shutdown: CPU clamp", func() { _, _ = clampOn() })
+	}
+	if d.state != c.last.state {
+		log.Printf("%scontroller %s -> shutdown (%s)", prErr, orNone(c.last.state), d.why)
+	}
+	c.last = d
+	st.Lock()
+	st.auto, st.duty, st.reason, st.state = 1, -1, d.why, d.state
 	st.Unlock()
 }
 
@@ -1019,7 +1040,10 @@ func (c *controller) cycle(now time.Time) {
 	}
 	if err != nil { // a bug or an impossible value: nothing to trust but the safe controller
 		log.Printf("%sdecide: %v", prErr, err)
-		d = c.safe("decide failed: "+err.Error(), now)
+		why := "decide failed: " + err.Error()
+		if !try("safe", func() { d = c.safe(why, now) }) {
+			d = ctlSafe(why) // even the read-back check failed: plain safe
+		}
 	}
 	try("act", func() { c.act(d, now) })
 	try("save", func() { c.saveState(now) })

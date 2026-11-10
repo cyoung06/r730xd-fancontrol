@@ -94,8 +94,8 @@ func validateConfig() {
 	check(cpuTarget-modelMargin > 20 && cpuTarget < cpuLimit && cpuLimit < cpuAuto && cpuAuto <= 100,
 		"need 20 < model.cpu_target - model.margin, cpu_target < model.cpu_limit < shutdown.cpu <= 100")
 	check(hddAuto > 0 && hddAuto <= 70 && exhaustAuto > 0 && exhaustAuto <= 80, "shutdown.hdd must be <= 70, shutdown.exhaust <= 80")
-	check(pcapMin >= 100 && pcapMin < pcapMax && pcapMax <= 2000 && pcapMax == math.Trunc(pcapMax) && pcapStep > 0,
-		"need 100 <= power.cap_min < power.cap_max <= 2000, cap_max a whole number, power.cap_step > 0")
+	check(pcapMin >= 100 && pcapMin < pcapMax && pcapMax <= 2000 && pcapMin == math.Trunc(pcapMin) && pcapMax == math.Trunc(pcapMax) && pcapStep > 0,
+		"need 100 <= power.cap_min < power.cap_max <= 2000, both whole watts, power.cap_step > 0")
 	check(fin(safeDuty, safeCap) && safeDuty >= minPct && safeDuty <= 100 && safeCap >= pcapMin && safeCap <= pcapMax && safeCap == math.Trunc(safeCap),
 		"safe.duty must be model.min_duty-100, safe.cap whole watts within power.cap_min-power.cap_max")
 	check(unknownAfter >= interval && unknownAfter <= time.Minute, "inputs.unknown_after must be inputs.interval-60 s")

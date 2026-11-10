@@ -19,6 +19,7 @@ type fakeBMC struct {
 	dutyErr  error              // FanDuty / FanAuto fail
 	capErr   error              // SetPowerCap fails
 	capFloor int                // SetPowerCap refuses caps below this (an iDRAC with a higher minimum)
+	capPanic bool               // SetPowerCap panics (a reply the parser didn't expect)
 	rpm      map[string]float64 // a fan's RPM regardless of the duty (dead fan); otherwise it follows the duty
 	fan      string             // "auto" or the duty
 	cap      int
@@ -87,6 +88,9 @@ func (f *fakeBMC) FanAuto() error {
 	return nil
 }
 func (f *fakeBMC) SetPowerCap(w int) error {
+	if f.capPanic {
+		panic("unexpected DCMI reply")
+	}
 	if f.capErr != nil {
 		return f.capErr
 	}
@@ -719,14 +723,47 @@ func TestCycleDecideFailSafeWindow(t *testing.T) {
 	st.mode, st.fixed = "fixed", 100 // fans fast: they need time to come down to safe.duty
 	st.Unlock()
 	run(c, f, at(0))
-	fanRPMTab = curve{{10, 3270}} // one point (validation would refuse it): the model panics
+	f.rpm["Fan1"], f.rpm["Fan2"] = 4790, 4790 // the fake's fans don't go through the table broken below
+	fanRPMTab = curve{{10, 3270}}             // one point (validation would refuse it): the model panics
 	defer loadConfigBytes(nil)
 	st.Lock()
 	st.mode = "model"
 	st.Unlock()
+	for s := 5; s <= 40; s += 5 { // the safe read-back check panics too: plain safe, no crash, no poweroff
+		run(c, f, at(s))
+		if c.last.state != "safe" || calls != 0 {
+			t.Fatalf("t=%d decide failing: %q calls %d", s, c.last.state, calls)
+		}
+	}
+}
+
+// Shutdown: the poweroff goes first, so a write that panics (or a hung BMC) can't stop or delay it.
+func TestCycleShutdownPoweroffFirst(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.vals["Exhaust"] = exhaustAuto
+	f.capPanic = true
+	for s := 5; s <= 25; s += 5 {
+		run(c, f, at(s))
+	}
+	if calls != 1 || c.last.state != "shutdown" {
+		t.Fatalf("poweroff calls %d, controller %q", calls, c.last.state)
+	}
+}
+
+// A sensor newly required on a reload that already reads fine is used at once: no spurious safe cycle.
+func TestCycleNewlyRequiredReading(t *testing.T) {
+	c, f, _ := rig(t)
+	run(c, f, at(0))
+	delete(c.in.Temps, "CPU2") // not expected so far (e.g. missing at the first good read)
+	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"CPU2\", \"Inlet\", \"Exhaust\"]\ninterval = \"5s\"\n"))
 	run(c, f, at(5))
-	if c.last.state != "safe" || calls != 0 {
-		t.Fatalf("decide failing: %q calls %d", c.last.state, calls)
+	if c.last.state != "model" || c.in.Temps["CPU2"].Seen.IsZero() {
+		t.Fatalf("newly required, reading: %q, CPU2 %v", c.last.state, c.in.Temps["CPU2"])
 	}
 }
 
