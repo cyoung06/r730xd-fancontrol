@@ -138,7 +138,7 @@ and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart contin
 | a reading at its `[shutdown]` line for 3 consecutive readings | danger → orderly shutdown, the iDRAC cooling meanwhile |
 | CPU ≥ `model.cpu_limit` in `model` | duty ≥ `model.emergency_duty` |
 | invalid settings (e.g. `inputs.interval` > 10 s, limits out of order, non-finite model values) | refuses to start; fans stay with the iDRAC |
-| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto`: CPU clamp undone, fans → iDRAC auto (retries for up to 12 s), power cap → `power.cap_max`; restart after 5 s |
+| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto`: CPU clamp undone, fans → iDRAC auto (retries for up to 12 s), power cap → `power.cap_max`; restart after 5 s. During a shutdown fanctl decided (`/run/fanctl/shutdown`), it keeps the CPUs at minimum power instead |
 | control loop hangs | systemd `WatchdogSec=60` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |

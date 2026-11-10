@@ -111,6 +111,9 @@ const (
 	kickEvery   = 30 * time.Second // missing drive temperatures: re-read at most this often
 )
 
+// shutdownMark: present while a shutdown is under way ("fanctl auto" then keeps minimum power).
+var shutdownMark = "/run/fanctl/shutdown"
+
 // poweroff: the last resort. A clean OS shutdown, so it works without the BMC (a var: tests replace it).
 var poweroff = func() error { return exec.Command("systemctl", "poweroff").Run() }
 
@@ -351,7 +354,7 @@ func (c *controller) logInputs(ns []named) {
 	}
 	for _, n := range ns {
 		w := c.readWhy[n.key]
-		if w == "" && (n.kind == kindExhaust || n.kind == kindOtherTemp || n.kind == kindFan) { // from the BMC
+		if w == "" && (n.kind == kindExhaust || n.kind == kindOtherTemp || n.kind == kindFan || n.key == "power cap") { // from the BMC
 			w = c.readWhy["*"]
 		}
 		if w == "" {
@@ -362,7 +365,7 @@ func (c *controller) logInputs(ns []named) {
 			log.Printf("%sdrive scan found %g drives (inputs.hdd_min %d): unknown", prErr, v, hddMin)
 		case n.kind == kindFan && v < fanMinRPM && !isNeverSeen(n.r):
 			log.Printf("%sfan %s at %g rpm (inputs.fan_min_rpm %g): unknown", prErr, n.key, v, fanMinRPM)
-		case n.kind == kindDrive && !isNeverSeen(n.r) && c.in.Scan.Seen != c.scanLogged &&
+		case n.kind == kindDrive && c.in.Scan.Seen != c.scanLogged && classify(n) == classOK &&
 			c.in.HDD[strings.TrimPrefix(n.key, "drive ")].Seen.Before(c.in.Scan.Seen):
 			log.Printf("%s%s: no temperature in the last scan, holding %g", prWarn, n.key, v)
 		}
@@ -718,6 +721,11 @@ func (c *controller) ctlSafe(why string, now time.Time) {
 func (c *controller) ctlShutdown(why string, now time.Time) {
 	if c.off == "" {
 		c.off = why
+		// fanctl is stopped as part of the poweroff: tell its "fanctl auto" to keep the CPUs at
+		// minimum power instead of restoring them
+		if err := os.WriteFile(shutdownMark, []byte(why+"\n"), 0o644); err != nil {
+			log.Printf("%sshutdown mark: %v", prErr, err)
+		}
 	}
 	if !c.poweredOff {
 		log.Printf("%sSHUTDOWN: %s", prErr, why)
@@ -727,7 +735,9 @@ func (c *controller) ctlShutdown(why string, now time.Time) {
 			c.poweredOff = true
 		}
 	}
-	if !c.shutdownTried { // once, each on its own (one failing can't skip the others); failures don't matter
+	// each on its own (one failing can't skip the others), failures don't matter; once the poweroff
+	// is accepted, otherwise again every cycle
+	if !c.shutdownTried || !c.poweredOff {
 		c.shutdownTried = true
 		try("shutdown: fans to the iDRAC", func() { c.setFans("auto", false, why, now) })
 		try("shutdown: CPU clamp", func() { c.setClamp(true, why) })
@@ -746,36 +756,34 @@ func (c *controller) safeMismatch(now time.Time) string {
 	if safeClamp && (!usable(c.in.Clamp) || c.in.Clamp.V != 1) {
 		bad = append(bad, "CPU clamp not in place")
 	}
-	var rpm []float64
-	for _, in := range c.in.Fans {
-		if usable(in) {
-			rpm = append(rpm, in.V)
-		}
-	}
-	if len(rpm) == 0 {
-		return strings.Join(append(bad, "no fan RPM"), "; ")
-	}
-	if med, floor := median(rpm), pctToRPM(safeCheckDuty); med < floor { // faster is fine: more cooling
+	if med, ok := c.safeFanRPM(now); !ok {
+		bad = append(bad, "no fan RPM")
+	} else if floor := pctToRPM(safeCheckDuty); med < floor {
 		bad = append(bad, fmt.Sprintf("fans at %.0f rpm, want >= %.0f", med, floor))
 	}
 	return strings.Join(bad, "; ")
 }
 
-// safeFansLow: the fans read below safe.check_duty's RPM (or not at all).
-func (c *controller) safeFansLow(now time.Time) bool {
+// safeFanRPM: the lower median of the fans that read recently, so most of the fans must reach
+// safe.check_duty's RPM (faster is fine: more cooling). ok=false: no fan reads.
+func (c *controller) safeFanRPM(now time.Time) (med float64, ok bool) {
 	var rpm []float64
 	for _, in := range c.in.Fans {
 		if !in.Seen.IsZero() && c.overdue(in.Seen, interval, now) < unknownAfter {
 			rpm = append(rpm, in.V)
 		}
 	}
-	return len(rpm) == 0 || median(rpm) < pctToRPM(safeCheckDuty)
+	if len(rpm) == 0 {
+		return 0, false
+	}
+	sort.Float64s(rpm)
+	return rpm[(len(rpm)-1)/2], true
 }
 
-func median(v []float64) float64 {
-	v = slices.Clone(v)
-	sort.Float64s(v)
-	return v[len(v)/2]
+// safeFansLow: the fans read below safe.check_duty's RPM (or not at all).
+func (c *controller) safeFansLow(now time.Time) bool {
+	med, ok := c.safeFanRPM(now)
+	return !ok || med < pctToRPM(safeCheckDuty)
 }
 
 // normal: the model's control law (unchanged from before the redesign; without a power reading it

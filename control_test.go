@@ -122,9 +122,10 @@ hdd_min = 0
 	hdds.Unlock()
 
 	dir := t.TempDir()
-	oldP, oldT, oldS, oldH := pstateDir, throttleState, stateFile, hwmonDir
+	oldP, oldT, oldS, oldH, oldM := pstateDir, throttleState, stateFile, hwmonDir, shutdownMark
 	pstateDir, throttleState, stateFile, hwmonDir = filepath.Join(dir, "intel_pstate"), filepath.Join(dir, "throttle"), filepath.Join(dir, "inputs.json"), filepath.Join(dir, "hwmon")
-	t.Cleanup(func() { pstateDir, throttleState, stateFile, hwmonDir = oldP, oldT, oldS, oldH })
+	shutdownMark = filepath.Join(dir, "shutdown")
+	t.Cleanup(func() { pstateDir, throttleState, stateFile, hwmonDir, shutdownMark = oldP, oldT, oldS, oldH, oldM })
 	for i, name := range []string{"power_meter", "coretemp", "coretemp"} { // like the server: hwmon0 power_meter, 1-2 coretemp
 		h := filepath.Join(hwmonDir, "hwmon"+strconv.Itoa(i))
 		os.MkdirAll(h, 0o755)
@@ -871,5 +872,47 @@ func TestCycleDriveLeavesWithScan(t *testing.T) {
 	run(c, f, at(5))
 	if _, still := c.in.HDD["B"]; still || len(c.in.HDD) != 1 {
 		t.Fatalf("pulled drive kept: %v", c.in.HDD)
+	}
+}
+
+// A shutdown leaves its mark (so the stop hook keeps minimum power); a failing poweroff keeps retrying
+// the hand-over of the fans to the iDRAC too.
+func TestCycleShutdownMarkAndRetry(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return errors.New("logind not answering") }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.vals["Exhaust"] = exhaustAuto
+	f.dutyErr = errors.New("ipmi: timeout") // the first hand-over fails too
+	for s := 5; s <= 15; s += 5 {
+		run(c, f, at(s))
+	}
+	if !exists(shutdownMark) || c.state != "shutdown" {
+		t.Fatalf("shutdown mark %v, controller %q", exists(shutdownMark), c.state)
+	}
+	f.dutyErr = nil
+	run(c, f, at(20))
+	if f.fan != "auto" || calls < 2 {
+		t.Fatalf("poweroff failing: fans %q (want the iDRAC's), poweroff tries %d", f.fan, calls)
+	}
+}
+
+// Most fans must reach check_duty's RPM: one fast fan doesn't hide a slow one (lower median).
+func TestCycleSafeMostFans(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	f.rpm["Fan1"], f.rpm["Fan2"] = 2000, 9000 // one above fan_min_rpm but slow, one fast
+	for s := 5; s <= 35; s += 5 {
+		run(c, f, at(s))
+	}
+	if calls != 1 {
+		t.Fatalf("half the fans slow in safe: poweroff calls %d", calls)
 	}
 }

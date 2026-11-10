@@ -161,7 +161,7 @@ func parseConfig(b []byte) (config, error) {
 	if c.Mode == "auto" {
 		c.Mode = "idrac"
 	}
-	if c.Safe.CheckDuty == 0 { // default: 15 %, never above safe.duty
+	if !md.IsDefined("safe", "check_duty") { // default: 15 %, never above safe.duty (an explicit 0 is refused)
 		c.Safe.CheckDuty = min(15, c.Safe.Duty)
 	}
 	if c.Fixed.CPUMax == 0 {
@@ -303,13 +303,14 @@ func prepareReload() (func(), error) {
 	}, nil
 }
 
-// capMaxForAuto: power.cap_max for "fanctl auto", read leniently: it must never block the hand-back.
-func capMaxForAuto() int {
+// capsForAuto: power.cap_min / cap_max for "fanctl auto", read leniently: it must never block the
+// hand-back.
+func capsForAuto() (capMin, capMax int) {
 	c := defaults()
 	if b, err := os.ReadFile(configPath()); err == nil {
 		if _, err := toml.Decode(string(b), &c); err != nil {
-			log.Printf("%s%s: %v (using cap_max %g)", prErr, configPath(), err, c.Power.CapMax)
+			log.Printf("%s%s: %v (using cap_min %g, cap_max %g)", prErr, configPath(), err, c.Power.CapMin, c.Power.CapMax)
 		}
 	}
-	return int(c.Power.CapMax)
+	return int(c.Power.CapMin), int(c.Power.CapMax)
 }

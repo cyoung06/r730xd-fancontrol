@@ -570,14 +570,19 @@ func handoffFresh() (bool, time.Duration) {
 // handing over), power cap lifted to power.cap_max. Reads nothing else: a bad config file must never
 // block the hand-back.
 func cmdAuto() {
-	if restored, err := clampOff(); err != nil {
+	shuttingDown := exists(shutdownMark) // fanctl decided a shutdown: keep the CPUs at minimum power
+	if shuttingDown {
+		if _, err := clampOn(); err != nil {
+			log.Printf("%sCPU clamp: %v", prErr, err)
+		}
+	} else if restored, err := clampOff(); err != nil {
 		log.Printf("%sCPU clamp restore failed: %v", prErr, err)
 	} else if restored {
 		log.Print("CPU clamp off")
 	}
 	fresh, age := handoffFresh()
 	os.Remove(handoffFile) // honoured once: the last step of a stop
-	if fresh {
+	if fresh && !shuttingDown {
 		log.Printf("%s is %.0fs old: leaving the fans for the restarting fanctl", handoffFile, age.Seconds())
 		return
 	}
@@ -588,8 +593,13 @@ func cmdAuto() {
 	}
 	if err == nil {
 		err = fansToIDRAC(bmc)
-		if w := capMaxForAuto(); w <= 0 {
-			log.Printf("%spower cap not lifted: power.cap_max %d", prErr, w)
+		capMin, capMax := capsForAuto()
+		w := capMax
+		if shuttingDown {
+			w = capMin
+		}
+		if w <= 0 {
+			log.Printf("%spower cap not set: %d W", prErr, w)
 		} else if cerr := bmc.SetPowerCap(w); cerr != nil {
 			log.Printf("%spower cap %d W failed: %v", prErr, w, cerr)
 		} else {
@@ -712,6 +722,7 @@ func main() {
 	}
 	c := newController(bmc)
 	c.loadState()
+	os.Remove(shutdownMark) // a run that starts decides afresh
 
 	// SIGUSR2 (systemctl kill -s USR2 fanctl): replace this process with the binary at the same path, e.g.
 	// after installing a new version. Same PID, never stopped, so the fans keep their duty and stay out of
