@@ -18,6 +18,8 @@ type fakeBMC struct {
 	readErr  error              // every Reading fails (BMC not answering)
 	dutyErr  error              // FanDuty / FanAuto fail
 	capErr   error              // SetPowerCap fails
+	capFloor int                // SetPowerCap refuses caps below this (an iDRAC with a higher minimum)
+	rpm      map[string]float64 // a fan's RPM regardless of the duty (dead fan); otherwise it follows the duty
 	fan      string             // "auto" or the duty
 	cap      int
 	fanCalls int
@@ -36,6 +38,7 @@ func newFakeBMC() *fakeBMC {
 		},
 		vals:    map[string]float64{"CPU1": 50, "CPU2": 51, "Inlet": 25, "Exhaust": 30, "Fan1": 3000, "Fan2": 3100, "power": 200},
 		missing: map[string]bool{},
+		rpm:     map[string]float64{},
 	}
 }
 
@@ -48,7 +51,24 @@ func (f *fakeBMC) Reading(s Sensor) (float64, bool, string, error) {
 	if f.missing[k] {
 		return 0, false, "reading unavailable, status 0x60", nil
 	}
+	if s.Type == sensorFan {
+		if v, ok := f.rpm[k]; ok {
+			return v, true, "", nil
+		}
+		switch p, err := strconv.Atoi(f.fan); {
+		case err == nil:
+			return pctToRPM(float64(p)), true, "", nil
+		case f.fan == "auto":
+			return 5000, true, "", nil
+		}
+	}
 	return f.vals[k], true, "", nil
+}
+func (f *fakeBMC) GetPowerLimit() (PowerLimit, error) {
+	if f.readErr != nil {
+		return PowerLimit{}, f.readErr
+	}
+	return PowerLimit{Active: f.cap > 0, Watts: f.cap}, nil
 }
 func (f *fakeBMC) FanDuty(p int) error {
 	f.fanCalls++
@@ -69,6 +89,9 @@ func (f *fakeBMC) FanAuto() error {
 func (f *fakeBMC) SetPowerCap(w int) error {
 	if f.capErr != nil {
 		return f.capErr
+	}
+	if w < f.capFloor {
+		return errors.New("dcmi set power limit: cc 0xc9 (out of range)")
 	}
 	f.cap = w
 	return nil
@@ -199,59 +222,83 @@ func TestCycleUnknownToSafe(t *testing.T) {
 // the clamp (local) still applies; the CPUs stay visible through coretemp.
 func TestCycleBMCDown(t *testing.T) {
 	c, f, get := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
 	run(c, f, at(0))
 	f.readErr, f.dutyErr, f.capErr = errors.New("ipmi: no response in 5s"), errors.New("ipmi: no response"), errors.New("ipmi: no response")
 	for s := 5; s <= 30; s += 5 {
 		run(c, f, at(s))
 	}
-	if c.last.state != "safe" || get("max_perf_pct") != "40" || c.in.Temps["CPU1"].Seen != at(30) {
+	// BMC inputs unknown since t=20 -> safe; the CPUs stay visible (coretemp), the clamp (local) applies
+	if c.last.state != "safe" || get("max_perf_pct") != "40" || !c.in.Temps["CPU1"].Seen.Equal(at(30)) {
 		t.Fatalf("BMC down: %q clamp %s CPU1 seen %v", c.last.state, get("max_perf_pct"), c.in.Temps["CPU1"].Seen)
 	}
-	f.readErr, f.dutyErr, f.capErr = nil, nil, nil
-	run(c, f, at(35)) // the actuators still count as failing (last cycle's writes): safe, whose writes now succeed
-	want(t, 35, c, f, get, "20", int(pcapMin), true)
-	run(c, f, at(40))
-	want(t, 40, c, f, get, "18", int(pcapMax), false)
+	// safe can't be confirmed (no fan RPM, no cap readback) for 15 s -> shutdown
+	run(c, f, at(35))
+	if c.last.state != "shutdown" || calls != 1 {
+		t.Fatalf("safe unconfirmable 15 s: %q, poweroff calls %d", c.last.state, calls)
+	}
 }
 
-// An actuator that won't take its value is an input like any other: unknown after 15 s -> safe.
-func TestCycleActuatorUnknown(t *testing.T) {
+// A write error is logged and retried, never an input: the readbacks say what took.
+func TestCycleWriteErrors(t *testing.T) {
 	c, f, get := rig(t)
 	run(c, f, at(0))
-	f.capErr = errors.New("dcmi: cc 0xc1")
 	st.Lock()
-	st.mode, st.fixed = "fixed", 30 // a duty change forces fan and cap writes
+	st.mode, st.fixed = "fixed", 30
 	st.Unlock()
-	f.dutyErr = errors.New("fan duty: cc 0xc3")
-	for s := 5; s <= 15; s += 5 {
+	f.capErr, f.dutyErr = errors.New("dcmi: cc 0xc1"), errors.New("fan duty: cc 0xc3")
+	for s := 5; s <= 40; s += 5 {
 		run(c, f, at(s))
 		if c.last.state != "fixed" {
 			t.Fatalf("t=%d: %q", s, c.last.state)
 		}
 	}
-	run(c, f, at(20)) // failing since 5
-	if c.last.state != "safe" || get("max_perf_pct") != "40" {
-		t.Fatalf("writes failing 15 s: %q clamp %s", c.last.state, get("max_perf_pct"))
-	}
 	f.capErr, f.dutyErr = nil, nil
-	run(c, f, at(25)) // the safe controller's writes go through -> actuators known again
-	run(c, f, at(30))
-	want(t, 30, c, f, get, "30", int(pcapMax), false)
+	run(c, f, at(45))
+	want(t, 45, c, f, get, "30", int(pcapMax), false)
 }
 
-// A dead fan (commanded, below FAN_MIN_RPM) is the fan actuator not doing what it's told: unknown -> safe.
+// The safe controller has to be in effect by its readbacks: an iDRAC that refuses safe.cap -> 15 s
+// later, the last resort.
+func TestCycleSafeNotEstablished(t *testing.T) {
+	c, f, get := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	f.capFloor = int(safeCap) + 10 // refuses 230 W; the cap reads back as the last one taken
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	for s := 5; s <= 30; s += 5 { // safe from t=20; cap still reads 586
+		run(c, f, at(s))
+	}
+	if c.last.state != "safe" || calls != 0 {
+		t.Fatalf("t=30: %q calls %d", c.last.state, calls)
+	}
+	run(c, f, at(35)) // 15 s in safe without its cap
+	if c.last.state != "shutdown" || calls != 1 {
+		t.Fatalf("safe not established 15 s: %q, poweroff calls %d", c.last.state, calls)
+	}
+	want(t, 35, c, f, get, "auto", int(pcapMax), true) // shutdown: the iDRAC cools; the 230 W cap is still refused
+}
+
+// A dead fan (commanded, below inputs.fan_min_rpm) is unknown -> safe.
 func TestCycleDeadFan(t *testing.T) {
 	c, f, get := rig(t)
 	run(c, f, at(0))
-	f.vals["Fan1"] = 400
+	f.rpm["Fan1"] = 400
 	run(c, f, at(5))
 	want(t, 5, c, f, get, "20", int(pcapMin), true)
-	f.vals["Fan1"] = 3000
+	delete(f.rpm, "Fan1")
 	run(c, f, at(10))
 	want(t, 10, c, f, get, "18", int(pcapMax), false)
 }
 
-// Danger (a reading at its *_AUTO line) -> orderly shutdown, once, in every mode, idrac included.
+// Danger (a reading at its shutdown line) needs 3 consecutive new readings: meanwhile unknown (safe,
+// or idrac in idrac mode); then orderly shutdown with the iDRAC cooling, once, in every mode.
 func TestCycleDanger(t *testing.T) {
 	for _, mode := range []string{"model", "fixed", "idrac"} {
 		for _, k := range []string{"CPU1", "Exhaust", "drive"} {
@@ -269,24 +316,97 @@ func TestCycleDanger(t *testing.T) {
 				st.mode = mode
 				st.Unlock()
 				run(c, f, at(0))
-				switch k {
-				case "CPU1":
-					f.vals["CPU1"] = cpuAuto
-				case "Exhaust":
-					f.vals["Exhaust"] = exhaustAuto
-				case "drive":
-					hdds.Lock()
-					hdds.temps, hdds.at = map[Drive]float64{d: hddAuto}, at(5)
-					hdds.Unlock()
+				for i, s := range []int{5, 10, 15} {
+					switch k {
+					case "CPU1":
+						f.vals["CPU1"] = cpuAuto
+					case "Exhaust":
+						f.vals["Exhaust"] = exhaustAuto
+					case "drive": // each confirmation is a fresh drive read (fanctl kicks one)
+						hdds.Lock()
+						hdds.temps, hdds.at = map[Drive]float64{d: hddAuto}, at(s)
+						hdds.Unlock()
+					}
+					run(c, f, at(s))
+					if i < 2 && (calls != 0 || c.last.state == "shutdown") {
+						t.Fatalf("reading %d: shutdown before confirmation", i+1)
+					}
 				}
-				run(c, f, at(5))
-				run(c, f, at(10))
+				run(c, f, at(20))
 				if calls != 1 || c.last.state != "shutdown" {
 					t.Fatalf("poweroff calls %d, controller %q", calls, c.last.state)
 				}
-				want(t, 10, c, f, get, "20", int(pcapMin), true)
+				want(t, 20, c, f, get, "auto", int(pcapMin), true)
 			})
 		}
+	}
+}
+
+// One reading over the line, then a normal one: no shutdown, the count starts over.
+func TestCycleDangerGlitch(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	for i, v := range []float64{exhaustAuto, 30, exhaustAuto, exhaustAuto, 30} {
+		f.vals["Exhaust"] = v
+		run(c, f, at(5+5*i))
+	}
+	if calls != 0 {
+		t.Fatalf("glitches powered off")
+	}
+}
+
+// A garbled drive byte (SMART can return up to 254) is no reading, not a danger.
+func TestCycleDriveImplausible(t *testing.T) {
+	c, f, get := rig(t)
+	d := Drive{ID: 1, Serial: "Z1P34VPQ"}
+	hdds.Lock()
+	hdds.ids, hdds.temps, hdds.at, hdds.scanned = []Drive{d}, map[Drive]float64{d: 30}, at(0), true
+	hdds.Unlock()
+	run(c, f, at(0))
+	hdds.Lock()
+	hdds.temps, hdds.at = map[Drive]float64{d: 254}, at(5)
+	hdds.Unlock()
+	run(c, f, at(5))
+	want(t, 5, c, f, get, "10", int(pcapMax), false)
+	if len(c.danger) != 0 || c.in.HDD["Z1P34VPQ"].V != 30 {
+		t.Fatalf("implausible drive value used: danger %v value %g", c.danger, c.in.HDD["Z1P34VPQ"].V)
+	}
+}
+
+// A failed fan write doesn't skip the down-ramp: it continues from the last duty written.
+func TestCycleRampAfterWriteError(t *testing.T) {
+	c, f, get := rig(t)
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	for s := 5; s <= 20; s += 5 {
+		run(c, f, at(s)) // safe from 20: 20 %
+	}
+	f.missing["Inlet"] = false
+	run(c, f, at(25))
+	want(t, 25, c, f, get, "18", int(pcapMax), false)
+	f.dutyErr = errors.New("fan duty: timeout")
+	run(c, f, at(30)) // 16 % not sent
+	f.dutyErr = nil
+	run(c, f, at(35))
+	want(t, 35, c, f, get, "16", int(pcapMax), false)
+}
+
+// required_temps follow the config, also on a reload: a sensor added is expected, one removed (and
+// never seen) is dropped.
+func TestCycleRequiredTempsFollowConfig(t *testing.T) {
+	c, f, get := rig(t)
+	run(c, f, at(0))
+	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"Exhuast\"]\ninterval = \"5s\"\n"))
+	run(c, f, at(5))
+	want(t, 5, c, f, get, "20", int(pcapMin), true) // the typo is never seen: unknown
+	loadConfigBytes([]byte("[inputs]\nrequired_temps = [\"CPU1\", \"Exhaust\"]\ninterval = \"5s\"\n"))
+	run(c, f, at(10))
+	if _, still := c.in.Temps["Exhuast"]; still || c.last.state != "model" {
+		t.Fatalf("typo still expected after the fix: %v, %q", c.in.Temps, c.last.state)
 	}
 }
 
@@ -379,7 +499,7 @@ func TestCycleBlindStart(t *testing.T) {
 	want(t, 5, c, f, get, "18", int(pcapMax), false)
 }
 
-// Drive temperatures age on their own period: unknown 15 s after the next read was due.
+// Drive temperatures age on their own period: unknown 15 s after the next read was due (plus driveSlack).
 func TestCycleDriveGap(t *testing.T) {
 	c, f, get := rig(t)
 	d := Drive{ID: 1, Serial: "Z1P34VPQ"}
@@ -390,10 +510,10 @@ func TestCycleDriveGap(t *testing.T) {
 	hdds.Lock()
 	hdds.temps, hdds.at = map[Drive]float64{}, at(300) // next read: no temperature
 	hdds.Unlock()
-	run(c, f, at(310))
-	want(t, 310, c, f, get, "10", int(pcapMax), false)
-	run(c, f, at(315))
-	want(t, 315, c, f, get, "20", int(pcapMin), true)
+	run(c, f, at(370)) // due at 300, plus driveSlack (60 s) for a slow pass, plus unknown_after (15 s)
+	want(t, 370, c, f, get, "10", int(pcapMax), false)
+	run(c, f, at(375))
+	want(t, 375, c, f, get, "20", int(pcapMin), true)
 }
 
 // CPU temperatures come from coretemp, not the BMC: per-core sensors are ignored; a coretemp

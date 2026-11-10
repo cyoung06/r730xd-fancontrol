@@ -284,11 +284,15 @@ func prepareReload() (func(), error) {
 		return nil, fmt.Errorf("%s refused: %s", configPath(), strings.TrimSpace(string(out)))
 	}
 	return func() {
-		oldListen, oldToken := listen, tokenFile
+		oldListen, oldToken, oldMode, oldFixed := listen, tokenFile, mode0, fixedPct0
 		st.Lock() // /metrics reads the settings under this lock
 		apply(c)
 		listen, tokenFile = oldListen, oldToken
-		st.mode, st.fixed = mode0, fixedPct0
+		// the file's mode / fixed.duty replace a runtime choice only when they changed in the file: a
+		// reload must not undo a fixed -> model hand-over (or a /control choice) by re-reading the same
+		if mode0 != oldMode || fixedPct0 != oldFixed {
+			st.mode, st.fixed = mode0, fixedPct0
+		}
 		st.Unlock()
 		log.Printf("reloaded %s: mode=%s", configPath(), mode0)
 	}, nil

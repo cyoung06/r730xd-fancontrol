@@ -100,18 +100,26 @@ Errors are data, not branches. Each cycle: **sense → classify → pick → con
   Inlet, exhaust, fans and wall power come from the BMC, drives from the PERC. Every input is a value
   plus when it last read valid; a failed, timed-out, implausible or "unavailable" read changes
   nothing, the input just gets older. Each one is logged with the source's answer.
-- **Classify.** Each input (each temperature, fan and drive, the drive count against `inputs.hdd_min`, and
-  each actuator: duty, power cap, CPU clamp) is **ok**, **unknown** or **danger**:
-  - unknown: never seen this run, or 15 s past its due time (5 s inputs: the 3rd missed read, 20 s
-    after the last good one; drives: 15 s after a missed `inputs.hdd_interval` read); a fan below
-    `inputs.fan_min_rpm`; an actuator whose writes have failed for 15 s. Until then the last value stands in.
-  - danger: CPU ≥ `shutdown.cpu`, drive ≥ `shutdown.hdd`, exhaust ≥ `shutdown.exhaust` (inlet has no line).
+- **Classify.** Each input (each temperature, fan and drive, the drive count against
+  `inputs.hdd_min`, and the read-backs of the power cap and the CPU clamp) is **ok**, **unknown** or
+  **danger**:
+  - unknown: never seen this run, or `inputs.unknown_after` (15 s) past its due time (5 s inputs: the
+    3rd missed read, 20 s after the last good one; drives: 15 s after a missed `inputs.hdd_interval`
+    read, plus a minute for a slow pass); a fan below `inputs.fan_min_rpm`. Until then the last value
+    stands in. Writes are never inputs: an error is logged and retried, and the read-backs say what took.
+  - danger: CPU ≥ `shutdown.cpu`, drive ≥ `shutdown.hdd`, exhaust ≥ `shutdown.exhaust` (inlet has
+    no line), for **3 consecutive new readings**. Until confirmed it counts as unknown, and a drive is
+    re-read at once. Drive values outside 1-99 °C are no reading.
 - **Pick.** The worst class: danger → **shutdown** (any mode); mode `idrac` → **idrac**; unknown →
   **safe**; otherwise the mode's controller (**model** or **fixed**).
-- **Control.** safe: 20 % fans, CPUs at minimum power (turbo off and `intel_pstate` `max_perf_pct` =
-  min, since RAPL is locked by the BIOS; iDRAC cap at `safe.cap`, all from `[safe]`); held a full CPU load with falling
-  temperatures. shutdown: the safe outputs plus a clean OS poweroff (`systemctl poweroff`), once.
-- **Act.** Each actuator is written only when it differs from what it last confirmed.
+- **Control.**
+  - safe: `[safe]` (20 % fans, CPUs at minimum power: turbo off and `intel_pstate` `max_perf_pct` =
+    min since RAPL is locked by the BIOS, iDRAC cap at `safe.cap`); held a full CPU load with falling
+    temperatures. It must be **verifiably** in effect: if the read-backs (fan RPM for the duty, the
+    cap, the clamp) don't match for 15 s, safe has failed → shutdown.
+  - shutdown: fans to the iDRAC, CPUs at minimum power, and a clean OS poweroff
+    (`systemctl poweroff`), once.
+- **Act.** Each actuator is written only when it differs from what was last written.
 
 A panic or an impossible value (NaN) in classify, pick or a controller → the safe controller. Inputs
 and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart continues a running gap.
@@ -121,8 +129,10 @@ and ages are saved every cycle in `/run/fanctl/inputs.json`, so a restart contin
 | a reading missing, timed out, implausible, "unavailable"; the BMC not answering | last value for 15 s past due, then safe (`fanctl_input_age_seconds`, `fanctl_controller`, `fanctl_cpu_clamped`) |
 | drive temperature missing, fewer than `inputs.hdd_min` drives, the PERC unreachable | same, on the drives' own period; a drive missing from one rescan stays expected until the next scan agrees |
 | a required sensor never seen this run | unknown at once → safe |
-| a fan below `inputs.fan_min_rpm`; duty, cap or clamp writes failing for 15 s | unknown → safe |
-| a reading at its `[shutdown]` line | danger → orderly shutdown |
+| a fan below `inputs.fan_min_rpm` | unknown → safe |
+| duty, cap or clamp writes failing | logged and retried; in safe, read-backs not matching for 15 s → shutdown |
+| the BMC not answering at all | its inputs unknown → safe; safe can't be confirmed (no fan RPM, no cap read-back) → shutdown 15 s later |
+| a reading at its `[shutdown]` line for 3 consecutive readings | danger → orderly shutdown, the iDRAC cooling meanwhile |
 | CPU ≥ `model.cpu_limit` in `model` | duty ≥ `model.emergency_duty` |
 | invalid settings (e.g. `inputs.interval` > 10 s, limits out of order, non-finite model values) | refuses to start; fans stay with the iDRAC |
 | fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto`: CPU clamp undone, fans → iDRAC auto (retries for up to 12 s), power cap → `power.cap_max`; restart after 5 s |

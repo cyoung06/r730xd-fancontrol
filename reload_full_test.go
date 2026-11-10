@@ -92,3 +92,40 @@ func TestReloadFullPath(t *testing.T) {
 		t.Fatalf("after repeated reloads: warm %v exhaust %v", warmCurve, exhaustModel)
 	}
 }
+
+// A config the validator would accept must be one the controller can run: empty curves are refused.
+func TestReloadRefusesEmptyCurve(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "fanctl.toml")
+	os.Setenv("FANCTL_CONFIG", file)
+	defer os.Unsetenv("FANCTL_CONFIG")
+	os.WriteFile(file, []byte("[model]\nhdd_curve = []\n"), 0o600)
+	if _, err := prepareReload(); err == nil {
+		t.Fatal("empty hdd_curve accepted")
+	}
+}
+
+// A reload re-reading the same mode doesn't undo a fixed -> model hand-over; a changed mode applies.
+func TestReloadKeepsFallback(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "fanctl.toml")
+	os.Setenv("FANCTL_CONFIG", file)
+	defer os.Unsetenv("FANCTL_CONFIG")
+	os.WriteFile(file, []byte("mode = \"fixed\"\n[fixed]\nduty = 40\n"), 0o600)
+	loadConfig()
+	st.mode, st.fixed = "model", 40 // fixed handed over to model
+	apply, err := prepareReload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply()
+	if st.mode != "model" {
+		t.Fatalf("same file reloaded: mode %q, want model kept", st.mode)
+	}
+	os.WriteFile(file, []byte("mode = \"fixed\"\n[fixed]\nduty = 50\n"), 0o600)
+	if apply, err = prepareReload(); err != nil {
+		t.Fatal(err)
+	}
+	apply()
+	if st.mode != "fixed" || st.fixed != 50 {
+		t.Fatalf("changed file: mode %q fixed %d", st.mode, st.fixed)
+	}
+}

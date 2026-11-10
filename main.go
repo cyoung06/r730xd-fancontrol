@@ -105,6 +105,7 @@ func validateConfig() {
 	check(len(exhaustModel) == 2 && fin(exhaustModel...) && exhaustModel[0] >= 0 && exhaustModel[1] >= 0 && exhaustModel[0]+exhaustModel[1] < 1,
 		"model.exhaust_model: need [a, b] >= 0 with a+b < 1 (the exhaust is a mix of inlet air and air warmed by the parts)")
 	for name, c := range map[string]curve{"model.cpu_curve": cpuCurve, "model.hdd_curve": hddCurve, "model.exhaust_curve": exhaustCurve, "model.warm_curve": warmCurve, "model.exhaust_excess_curve": exhaustExcessCurve} {
+		check(len(c) >= 1, "%s needs at least one [temp, duty] point", name)
 		for _, p := range c {
 			check(fin(p.x) && pct(p.y), "%s: bad point %g:%g (duty must be 0-100)", name, p.x, p.y)
 		}
@@ -345,13 +346,17 @@ func hddWorker(kick <-chan struct{}) {
 	}
 }
 
-// hddLoop keeps hdds fresh: every inputs.hdd_interval (or when kicked), rescanning every inputs.hdd_rescan.
+// hddLoop keeps hdds fresh: a pass every inputs.hdd_interval from the start of the last one (a slow
+// pass doesn't push the schedule), or when kicked. It rescans every inputs.hdd_rescan, and also on a
+// kick while a drive's temperature is missing (at most once a minute), so a pulled drive is confirmed
+// gone (two scans must agree) within minutes instead of two inputs.hdd_rescan.
 func hddLoop(p *Perc, kick <-chan struct{}) {
 	var ids []Drive
 	var scanAt time.Time
-	shrink := false
+	shrink, missing := false, false
 	for {
-		if time.Since(scanAt) >= hddRescan {
+		passAt := time.Now()
+		if time.Since(scanAt) >= hddRescan || (missing && time.Since(scanAt) >= time.Minute) {
 			found := p.Scan()
 			switch {
 			case scanAt.IsZero():
@@ -360,8 +365,8 @@ func hddLoop(p *Perc, kick <-chan struct{}) {
 			case fmt.Sprint(found) == fmt.Sprint(ids):
 				shrink = false
 			case len(found) < len(ids) && !shrink:
-				// a drive missing from one scan may be a controller hiccup: keep expecting it (its
-				// missing temperature keeps the iDRAC in charge) until the next scan agrees
+				// a drive missing from one scan may be a controller hiccup: keep expecting it until the
+				// next scan agrees
 				log.Printf("drives missing from scan: %v -> %v (confirming on the next scan)", ids, found)
 				shrink = true
 			default:
@@ -376,11 +381,12 @@ func hddLoop(p *Perc, kick <-chan struct{}) {
 				temps[d] = t
 			}
 		}
+		missing = len(temps) < len(ids)
 		hdds.Lock()
 		hdds.ids, hdds.temps, hdds.at, hdds.scanned = ids, temps, time.Now(), true
 		hdds.Unlock()
 		select {
-		case <-time.After(hddInterval):
+		case <-time.After(time.Until(passAt.Add(hddInterval))):
 		case <-kick:
 		}
 	}

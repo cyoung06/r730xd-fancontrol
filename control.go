@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ type bmcAPI interface {
 	FanDuty(pct int) error
 	FanAuto() error
 	SetPowerCap(watts int) error
+	GetPowerLimit() (PowerLimit, error)
 }
 
 // input: a reading and when it was last valid (zero = never: counts from the start of this run).
@@ -63,6 +65,8 @@ type inputs struct {
 	HDD    map[string]input // drive temperatures, by serial
 	Drives time.Time        // last drive scan that found >= inputs.hdd_min drives
 	Power  input            // wall watts; optional (the model falls back to its curves without it)
+	Cap    input            // power cap read back from the iDRAC, W (an inactive cap reads as power.cap_max)
+	Clamp  input            // CPU clamp read back from intel_pstate: 1 = clamped
 }
 
 func (in *inputs) init() {
@@ -77,22 +81,19 @@ func (in *inputs) init() {
 	}
 }
 
-// actuator: the value the device last confirmed, and since when the wanted value hasn't been taken.
+// actuator: what was last written successfully. Whether it took is checked by reading it back (the
+// inputs Fans, Cap, Clamp), never assumed from a write's return code.
 type actuator struct {
-	have    string    // last confirmed value; "" = unknown (never written, or the last write failed)
-	at      time.Time // when it was confirmed
-	pending time.Time // first failed write since the last success; zero = none
+	have string    // last value written without an error; "" = none (never, or the last write failed)
+	at   time.Time // when
 }
 
 func (a *actuator) result(want string, err error, now time.Time) {
 	if err == nil {
-		a.have, a.at, a.pending = want, now, time.Time{}
+		a.have, a.at = want, now
 		return
 	}
 	a.have = ""
-	if a.pending.IsZero() {
-		a.pending = now
-	}
 }
 
 // desired: what one cycle wants the hardware to do.
@@ -105,6 +106,19 @@ type desired struct {
 	state string // the controller that produced it
 	off   bool   // shut the server down
 }
+
+// dangerRun: consecutive new readings at/above the shutdown line (danger is confirmed at dangerReads).
+type dangerRun struct {
+	n    int
+	seen time.Time // the last reading counted
+}
+
+const (
+	dangerReads = 3                // consecutive readings at/above a shutdown line before the poweroff
+	driveSlack  = time.Minute      // a drive pass may run this much longer than usual
+	safeRPMTol  = 0.25             // safe: fan RPM within this fraction of what safe.duty should give
+	kickEvery   = 30 * time.Second // missing drive temperatures: re-read at most this often
+)
 
 // poweroff: the last resort. A clean OS shutdown, so it works without the BMC (a var: tests replace it).
 var poweroff = func() error { return exec.Command("systemctl", "poweroff").Run() }
@@ -121,8 +135,12 @@ type controller struct {
 	held []string // inputs bridged with their last value this cycle
 
 	fan, pcap, clamp actuator
-	duty             float64 // last duty confirmed (valid when fan.have is a percent): the down-ramp starts here
-	last             desired // last cycle's decision
+	duty             float64              // last duty written (0 = none, or the iDRAC's): the model's down-ramp starts here
+	last             desired              // last cycle's decision
+	safeOK           time.Time            // safe: last cycle its readbacks matched (or it was entered)
+	danger           map[string]dangerRun // readings at/above their shutdown line, confirming
+	lastKick         time.Time            // last early drive re-read asked for
+	bmcDown          bool                 // the BMC didn't answer this cycle
 
 	// normal control
 	modelI, capCorr float64
@@ -136,7 +154,7 @@ type controller struct {
 }
 
 func newController(bmc bmcAPI) *controller {
-	c := &controller{bmc: bmc, now: time.Now, kick: make(chan struct{}, 1), reload: make(chan func(), 1)}
+	c := &controller{bmc: bmc, now: time.Now, kick: make(chan struct{}, 1), reload: make(chan func(), 1), danger: map[string]dangerRun{}}
 	c.start = c.now()
 	c.in.init()
 	return c
@@ -190,6 +208,18 @@ func (c *controller) sense(now time.Time) {
 		}
 		log.Printf("temperature sensors: %s; fans: %d", fmtTemps(temps), len(fans))
 	}
+	// required_temps follow the config (also after a reload, or state carried over from a run with
+	// other settings): a required one is expected even unseen; an unseen one no longer required goes
+	for _, k := range requiredTemps {
+		if _, ok := c.in.Temps[k]; !ok {
+			c.in.Temps[k] = input{}
+		}
+	}
+	for k, in := range c.in.Temps {
+		if in.Seen.IsZero() && !slices.Contains(requiredTemps, k) {
+			delete(c.in.Temps, k)
+		}
+	}
 	for k := range c.in.Temps {
 		if v, ok := temps[k]; ok {
 			c.in.Temps[k] = input{v, now}
@@ -200,6 +230,22 @@ func (c *controller) sense(now time.Time) {
 			c.in.Fans[k] = input{v, now}
 		}
 	}
+	if !c.bmcDown { // the BMC answered this cycle: read the cap back (a hung BMC costs one timeout, not two)
+		if pl, err := c.bmc.GetPowerLimit(); err == nil {
+			w := float64(pl.Watts)
+			if !pl.Active {
+				w = pcapMax
+			}
+			c.in.Cap = input{w, now}
+		} else {
+			why["power cap"] = err.Error()
+		}
+	}
+	if clamped, err := clampState(); err == nil {
+		c.in.Clamp = input{map[bool]float64{false: 0, true: 1}[clamped], now}
+	} else {
+		why["CPU clamp"] = err.Error()
+	}
 	c.senseDrives(now)
 	c.logInputs(now, why)
 }
@@ -208,10 +254,12 @@ func (c *controller) sense(now time.Time) {
 // power; why says what the BMC answered for each reading it didn't give.
 func (c *controller) senseBMC(now time.Time) (temps, fans map[string]float64, why map[string]string) {
 	temps, fans, why = map[string]float64{}, map[string]float64{}, map[string]string{}
+	c.bmcDown = false
 	if c.sensors == nil {
 		s, err := c.bmc.Sensors()
 		if err != nil {
 			why["*"] = "sensor repository: " + err.Error()
+			c.bmcDown = true
 			return
 		}
 		c.sensors = s
@@ -230,7 +278,7 @@ func (c *controller) senseBMC(now time.Time) (temps, fans map[string]float64, wh
 		v, ok, w, err := c.bmc.Reading(s)
 		switch {
 		case err != nil:
-			fail, why[k] = err, err.Error()
+			fail, why[k], c.bmcDown = err, err.Error(), true
 		case !ok:
 			why[k] = w
 		case s.Type == sensorTemp && !(v > 0 && v < 127):
@@ -308,6 +356,12 @@ func (c *controller) senseDrives(now time.Time) {
 	keep, missing := map[string]bool{}, []string{}
 	for _, d := range ids {
 		keep[d.Serial] = true
+		if t, ok := temps[d]; ok && !(t > 0 && t < 100) { // a garbled SMART/LOG SENSE byte is no reading
+			if at != c.hddSnap {
+				log.Printf("%sdrive %s: implausible temperature %g C", prWarn, d.Serial, t)
+			}
+			delete(temps, d)
+		}
 		if t, ok := temps[d]; ok {
 			if at.After(c.in.HDD[d.Serial].Seen) {
 				c.in.HDD[d.Serial] = input{t, at}
@@ -325,9 +379,8 @@ func (c *controller) senseDrives(now time.Time) {
 		}
 	}
 	if len(missing) > 0 {
-		select {
-		case c.kick <- struct{}{}: // re-read the drives now instead of in inputs.hdd_interval
-		default:
+		if now.Sub(c.lastKick) >= kickEvery {
+			c.kickDrives(now) // re-read (and, for a pulled drive, rescan) now instead of in inputs.hdd_interval
 		}
 		if at != c.hddSnap {
 			log.Printf("%sdrive temperature missing: %v", prWarn, missing)
@@ -337,6 +390,14 @@ func (c *controller) senseDrives(now time.Time) {
 		log.Printf("%sonly %d drives found (inputs.hdd_min %d)", prWarn, len(ids), hddMin)
 	}
 	c.hddSnap = at
+}
+
+func (c *controller) kickDrives(now time.Time) {
+	select {
+	case c.kick <- struct{}{}:
+	default:
+	}
+	c.lastKick = now
 }
 
 // logInputs logs every expected temperature and fan that didn't read valid this cycle, with the
@@ -381,15 +442,6 @@ func (c *controller) logInputs(now time.Time, why map[string]string) {
 }
 
 func isCPU(k string) bool { return strings.HasPrefix(k, "CPU") }
-
-func sortedFloat(m map[string]float64) []string {
-	k := make([]string, 0, len(m))
-	for x := range m {
-		k = append(k, x)
-	}
-	sort.Strings(k)
-	return k
-}
 
 func sortedKeys(m map[string]input) []string {
 	k := make([]string, 0, len(m))
@@ -477,24 +529,45 @@ func (c *controller) readings(now time.Time) []named {
 		out = append(out, named{k, kindFan, readingOf(c.in.Fans[k], interval, now)})
 	}
 	for _, k := range sortedKeys(c.in.HDD) {
-		out = append(out, named{"drive " + k, kindDrive, readingOf(c.in.HDD[k], hddInterval, now)})
+		out = append(out, named{"drive " + k, kindDrive, readingOf(c.in.HDD[k], hddInterval+driveSlack, now)})
 	}
-	if c.in.Drives.IsZero() {
-		out = append(out, named{"drive scan", kindOther, NeverSeen{}})
-	} else {
-		out = append(out, named{"drive scan", kindOther, Stale{1, now.Sub(c.in.Drives) - hddInterval}})
+	out = append(out, named{"drive scan", kindOther, readingOf(input{1, c.in.Drives}, hddInterval+driveSlack, now)})
+	out = append(out, named{"power cap", kindOther, readingOf(c.in.Cap, interval, now)})
+	out = append(out, named{"CPU clamp", kindOther, readingOf(c.in.Clamp, interval, now)})
+	return out
+}
+
+// seenOf: when the reading behind n was taken (for counting new readings).
+func (c *controller) seenOf(n named) time.Time {
+	switch n.kind {
+	case kindDrive:
+		return c.in.HDD[strings.TrimPrefix(n.key, "drive ")].Seen
+	case kindFan:
+		return c.in.Fans[n.key].Seen
 	}
-	for _, a := range []struct {
-		name string
-		a    *actuator
-	}{{"fan control", &c.fan}, {"power cap", &c.pcap}, {"CPU clamp", &c.clamp}} {
-		if a.a.pending.IsZero() {
-			out = append(out, named{a.name, kindOther, Fresh{1}})
-		} else {
-			out = append(out, named{a.name, kindOther, Stale{1, now.Sub(a.a.pending)}})
+	return c.in.Temps[n.key].Seen
+}
+
+// confirm: a reading at/above its shutdown line is danger only after dangerReads consecutive new
+// readings; until then it is unknown (the safe controller acts at once) and a drive is re-read now.
+func (c *controller) confirm(n named, k Class, now time.Time) Class {
+	if k != classDanger {
+		delete(c.danger, n.key)
+		return k
+	}
+	r, seen := c.danger[n.key], c.seenOf(n)
+	if !seen.Equal(r.seen) {
+		r.n, r.seen = r.n+1, seen
+		c.danger[n.key] = r
+		log.Printf("%s%s %g at/above its shutdown line (%d/%d)", prErr, n.key, value(n.r), r.n, dangerReads)
+		if n.kind == kindDrive && r.n < dangerReads {
+			c.kickDrives(now)
 		}
 	}
-	return out
+	if r.n >= dangerReads {
+		return classDanger
+	}
+	return classUnknown
 }
 
 // classify: never seen or unknownAfter past due -> unknown; otherwise the value against its limits.
@@ -587,7 +660,7 @@ func (c *controller) decide(now time.Time) (desired, error) {
 	ns := c.readings(now)
 	worst, worstKey := classOK, ""
 	for _, n := range ns {
-		if k := classify(n); k > worst {
+		if k := c.confirm(n, classify(n), now); k > worst {
 			worst, worstKey = k, n.key
 		}
 	}
@@ -604,11 +677,19 @@ func (c *controller) decide(now time.Time) (desired, error) {
 		}
 	}
 	why := fmt.Sprintf("%s %s", worstKey, worst)
-	switch pick(mode, worst) {
-	case "shutdown":
-		d := ctlSafe(why)
-		d.state, d.off = "shutdown", true
-		return d, nil
+	picked := pick(mode, worst)
+	if picked == "safe" {
+		if c.last.state != "safe" {
+			c.safeOK = now // just entered: the fans need a moment to reach safe.duty
+		} else if bad := c.safeMismatch(now); bad == "" {
+			c.safeOK = now
+		} else if now.Sub(c.safeOK) >= unknownAfter { // safe can't be established: last resort
+			picked, why = "shutdown", "safe not established: "+bad
+		}
+	}
+	switch picked {
+	case "shutdown": // orderly poweroff; meanwhile the iDRAC cools, the CPUs at minimum power
+		return desired{fan: "auto", cap: int(pcapMin), clamp: true, why: why, state: "shutdown", off: true}, nil
 	case "idrac":
 		return desired{fan: "auto", cap: int(pcapMax), why: "mode=idrac", state: "idrac"}, nil
 	case "safe":
@@ -617,6 +698,34 @@ func (c *controller) decide(now time.Time) (desired, error) {
 		return desired{fan: strconv.Itoa(fixedPct), duty: float64(fixedPct), cap: int(pcapMax), why: "fixed", state: "fixed"}, nil
 	}
 	return c.ctlModel(ns, now)
+}
+
+// safeMismatch: what the readbacks say differs from the safe controller's settings ("" = established).
+func (c *controller) safeMismatch(now time.Time) string {
+	usable := func(in input) bool { return !in.Seen.IsZero() && c.overdue(in.Seen, interval, now) < unknownAfter }
+	var bad []string
+	if !usable(c.in.Cap) || c.in.Cap.V != safeCap {
+		bad = append(bad, fmt.Sprintf("power cap reads %g W, want %g", c.in.Cap.V, safeCap))
+	}
+	if want := map[bool]float64{false: 0, true: 1}[safeClamp]; !usable(c.in.Clamp) || c.in.Clamp.V != want {
+		bad = append(bad, "CPU clamp not in place")
+	}
+	var rpm []float64
+	for _, in := range c.in.Fans {
+		if usable(in) {
+			rpm = append(rpm, in.V)
+		}
+	}
+	if len(rpm) == 0 {
+		bad = append(bad, "no fan RPM")
+	} else {
+		sort.Float64s(rpm)
+		med, want := rpm[len(rpm)/2], pctToRPM(safeDuty)
+		if math.Abs(med-want) > safeRPMTol*want {
+			bad = append(bad, fmt.Sprintf("fans at %.0f rpm, want ~%.0f", med, want))
+		}
+	}
+	return strings.Join(bad, "; ")
 }
 
 // ctlModel: power first (the cap holds the CPUs at model.cpu_target with the fans at model.fan_max), then the
@@ -656,7 +765,7 @@ func (c *controller) normal(temps, hdd map[string]float64, watts float64) (decis
 	var r decision
 	capW := int(pcapMax)
 	ivl := interval.Seconds()
-	ramping := c.fan.have != "" && c.fan.have != "auto"
+	ramping := c.duty > 0
 	switch {
 	default:
 		// feedforward power: RAPL reacts within a cycle; the iDRAC wall reading lags ~30 s.
@@ -796,8 +905,8 @@ func (c *controller) act(d desired, now time.Time) {
 		case changed:
 			log.Printf("duty %s%% (%s) %s", d.fan, d.why, fmtTemps(c.heldValues()))
 		}
-		if err == nil && d.fan != "auto" {
-			c.duty, _ = strconv.ParseFloat(d.fan, 64) // the down-ramp starts from what was really sent
+		if err == nil {
+			c.duty, _ = strconv.ParseFloat(d.fan, 64) // the down-ramp starts from what was really sent ("auto": 0)
 		}
 	}
 	if d.off && !c.poweredOff {
@@ -1036,6 +1145,17 @@ func clampOn() (newly bool, err error) {
 		err = errors.Join(err, writePstate("max_perf_pct", mn))
 	}
 	return newly, err
+}
+
+// clampState: are the CPUs clamped right now (turbo off and max_perf_pct at its minimum)?
+func clampState() (bool, error) {
+	nt, err1 := readTrim(pstateDir + "/no_turbo")
+	mx, err2 := readTrim(pstateDir + "/max_perf_pct")
+	mn, err3 := readTrim(pstateDir + "/min_perf_pct")
+	if err := errors.Join(err1, err2, err3); err != nil {
+		return false, err
+	}
+	return nt == "1" && mx == mn, nil
 }
 
 // clampOff restores what clampOn saved (restored=false: nothing was clamped).
