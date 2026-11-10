@@ -750,8 +750,8 @@ func TestCycleShutdownPoweroffFirst(t *testing.T) {
 	for s := 5; s <= 25; s += 5 {
 		run(c, f, at(s))
 	}
-	if calls != 1 || c.state != "shutdown" {
-		t.Fatalf("poweroff calls %d, controller %q", calls, c.state)
+	if calls != 1 || c.state != "shutdown" || f.fan != "auto" {
+		t.Fatalf("poweroff calls %d, controller %q, fans %q (want the iDRAC's)", calls, c.state, f.fan)
 	}
 }
 
@@ -805,5 +805,71 @@ func TestCycleDangerCountForgotten(t *testing.T) {
 	run(c, f, at(20))
 	if calls != 0 {
 		t.Fatalf("one reading after reinsertion powered off")
+	}
+}
+
+// Safe is in effect with the fans at least check_duty's RPM: faster (the iDRAC raising them) is fine.
+func TestCycleSafeFansFaster(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	f.rpm["Fan1"], f.rpm["Fan2"] = 9000, 9000
+	for s := 5; s <= 60; s += 5 {
+		run(c, f, at(s))
+	}
+	if calls != 0 || c.state != "safe" {
+		t.Fatalf("fans faster than safe: %q, poweroff calls %d", c.state, calls)
+	}
+}
+
+// Fans below check_duty's RPM: safe sends its duty again every cycle while it waits, and powers off
+// only if 15 s of that doesn't help.
+func TestCycleSafeResendsFans(t *testing.T) {
+	c, f, _ := rig(t)
+	calls := 0
+	old := poweroff
+	poweroff = func() error { calls++; return nil }
+	defer func() { poweroff = old }()
+	run(c, f, at(0))
+	f.missing["Inlet"] = true
+	for s := 5; s <= 20; s += 5 {
+		run(c, f, at(s)) // safe from 20
+	}
+	f.rpm["Fan1"], f.rpm["Fan2"] = 1500, 1500 // something else slowed them
+	before := f.fanCalls
+	for s := 25; s <= 30; s += 5 {
+		run(c, f, at(s))
+	}
+	if f.fanCalls-before < 2 {
+		t.Fatalf("duty not re-sent while safe isn't in effect: %d writes", f.fanCalls-before)
+	}
+	delete(f.rpm, "Fan1")
+	delete(f.rpm, "Fan2") // the re-send worked
+	for s := 35; s <= 60; s += 5 {
+		run(c, f, at(s))
+	}
+	if calls != 0 {
+		t.Fatalf("powered off although the re-send fixed it")
+	}
+}
+
+// The stored drives mirror the scan: a pulled drive leaves (metrics, state file).
+func TestCycleDriveLeavesWithScan(t *testing.T) {
+	c, f, _ := rig(t)
+	d1, d2 := Drive{ID: 1, Serial: "A"}, Drive{ID: 2, Serial: "B"}
+	hdds.Lock()
+	hdds.ids, hdds.temps, hdds.at, hdds.scanned = []Drive{d1, d2}, map[Drive]float64{d1: 30, d2: 31}, at(0), true
+	hdds.Unlock()
+	run(c, f, at(0))
+	hdds.Lock()
+	hdds.ids, hdds.temps, hdds.at = []Drive{d1}, map[Drive]float64{d1: 30}, at(5)
+	hdds.Unlock()
+	run(c, f, at(5))
+	if _, still := c.in.HDD["B"]; still || len(c.in.HDD) != 1 {
+		t.Fatalf("pulled drive kept: %v", c.in.HDD)
 	}
 }

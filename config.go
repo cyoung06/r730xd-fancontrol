@@ -64,6 +64,8 @@ type config struct {
 		Duty  float64 `toml:"duty"`
 		Cap   float64 `toml:"cap"`   // iDRAC power cap, W
 		Clamp bool    `toml:"clamp"` // CPUs at their lowest frequency, no turbo
+		// in effect when the fans read at least this duty's RPM and the power is at its minimum
+		CheckDuty float64 `toml:"check_duty"`
 	} `toml:"safe"`
 
 	Model struct {
@@ -120,7 +122,7 @@ func defaults() config {
 	var c config
 	c.Mode = "model"
 	c.Shutdown.CPU, c.Shutdown.HDD, c.Shutdown.Exhaust = 85, 50, 65
-	c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp = 20, 230, true
+	c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp, c.Safe.CheckDuty = 20, 230, true, 15
 	m := &c.Model
 	m.MinDuty, m.FanMax, m.CPUTarget, m.Margin, m.CPULimit, m.EmergencyDuty = 10, 0, 75, 3, 78, 50
 	m.KI, m.IMax = 1.0, 15
@@ -181,7 +183,7 @@ func apply(c config) {
 	}
 	mode0, fixedPct0 = c.Mode, int(c.Fixed.Duty)
 	cpuAuto, hddAuto, exhaustAuto = c.Shutdown.CPU, c.Shutdown.HDD, c.Shutdown.Exhaust
-	safeDuty, safeCap, safeClamp = c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp
+	safeDuty, safeCap, safeClamp, safeCheckDuty = c.Safe.Duty, c.Safe.Cap, c.Safe.Clamp, c.Safe.CheckDuty
 	m := c.Model
 	minPct, fanMax, cpuTarget, modelMargin, cpuLimit, emergencyPct = m.MinDuty, m.FanMax, m.CPUTarget, m.Margin, m.CPULimit, m.EmergencyDuty
 	ki, iMax = m.KI, m.IMax

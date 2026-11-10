@@ -115,8 +115,9 @@ Errors are data, not branches. Each cycle: **sense → classify → pick → con
 - **Control.**
   - safe: `[safe]` (20 % fans, CPUs at minimum power: turbo off and `intel_pstate` `max_perf_pct` =
     min since RAPL is locked by the BIOS, iDRAC cap at `safe.cap`); held a full CPU load with falling
-    temperatures. It must be **verifiably** in effect: if the read-backs (fan RPM for the duty, the
-    cap, the clamp) don't match for 15 s, safe has failed → shutdown.
+    temperatures. It must be **verifiably** in effect: fans reading at least `safe.check_duty`'s RPM
+    (faster is fine), the cap at most `safe.cap`, the clamp on. Until then it re-sends its settings;
+    not in effect after 15 s → shutdown.
   - shutdown: fans to the iDRAC, CPUs at minimum power, and a clean OS poweroff
     (`systemctl poweroff`), once.
 - **Act.** Each actuator is written only when it differs from what was last written.

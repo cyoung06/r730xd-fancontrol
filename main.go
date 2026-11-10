@@ -55,7 +55,7 @@ var (
 	fixedCPUMax, fixedHDDMax, fixedExhaustMax              float64 // fixed mode hands over to model at or above
 	interval, hddInterval, hddRescan, reassert             time.Duration
 	unknownAfter                                           time.Duration // past due -> unknown
-	safeDuty, safeCap                                      float64       // the safe controller
+	safeDuty, safeCap, safeCheckDuty                       float64       // the safe controller
 	safeClamp                                              bool
 	cpuCurve, hddCurve, exhaustCurve, warmCurve, fanRPMTab curve
 	cpuModels                                              []cpuModel
@@ -98,6 +98,7 @@ func validateConfig() {
 		"need 100 <= power.cap_min < power.cap_max <= 2000, both whole watts, power.cap_step > 0")
 	check(fin(safeDuty, safeCap) && safeDuty >= minPct && safeDuty <= 100 && safeCap >= pcapMin && safeCap <= pcapMax && safeCap == math.Trunc(safeCap),
 		"safe.duty must be model.min_duty-100, safe.cap whole watts within power.cap_min-power.cap_max")
+	check(fin(safeCheckDuty) && safeCheckDuty > 0 && safeCheckDuty <= safeDuty, "safe.check_duty must be above 0 and at most safe.duty")
 	check(unknownAfter >= interval && unknownAfter <= time.Minute, "inputs.unknown_after must be inputs.interval-60 s")
 	check(len(cpuModels) >= 1 && len(fanRPMTab) >= 2, "model.cpu_models needs >= 1 entry, model.fan_rpm_table >= 2 points")
 	check(hddMin >= 0 && fanMinRPM >= 0, "inputs.hdd_min and inputs.fan_min_rpm must be >= 0")

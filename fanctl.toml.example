@@ -13,6 +13,8 @@ exhaust = 65
 duty  = 20
 cap   = 230                    # iDRAC power cap, W
 clamp = true                   # CPUs at their lowest frequency, no turbo (intel_pstate)
+check_duty = 15                # in effect: fans at least this duty's RPM, power cap <= cap, clamp on;
+                               # not in effect within 15 s -> shutdown
 
 [model]
 min_duty       = 10
