@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -62,7 +63,8 @@ type inputs struct {
 	Temps  map[string]input // BMC temperatures
 	Fans   map[string]input // BMC fan RPM
 	HDD    map[string]input // drive temperatures, by serial
-	Drives time.Time        // last drive scan that found >= inputs.hdd_min drives
+	Scan   input            // last drive scan: number of drives found
+	Drives []string         // the serials that scan found (the drives that count)
 	Power  input            // wall watts; optional (the model falls back to its curves without it)
 	Cap    input            // power cap read back from the iDRAC, W (an inactive cap reads as power.cap_max)
 	Clamp  input            // CPU clamp read back from intel_pstate: 1 = clamped
@@ -138,7 +140,8 @@ type controller struct {
 	hotHist         []float64 // hottest CPU, last 60 s
 	raplOff         float64   // learned wall - RAPL offset (W); valid when raplLearned
 	raplLearned     bool
-	hddSnap         time.Time // drive snapshot last looked at (missing drives are logged once per snapshot)
+	hddSnap         time.Time         // drive snapshot last looked at (implausible values are logged once per snapshot)
+	readWhy         map[string]string // what each source answered for a reading it didn't give, this cycle
 	saveErr         string
 	poweredOff      bool // poweroff accepted: nothing more to do
 }
@@ -173,55 +176,20 @@ func sensorKey(s Sensor) string {
 	return "power"
 }
 
+// sense stores every reading that read valid as (value, now), and what each source answered for
+// the ones that didn't. Nothing else: which inputs count and what to do about missing ones is choose's.
 func (c *controller) sense(now time.Time) {
 	temps, fans, why := c.senseBMC(now)
 	cpus, cwhy := senseCoretemp()
-	for k, v := range cpus {
-		temps[k] = v
+	maps.Copy(temps, cpus)
+	maps.Copy(why, cwhy)
+	for k, v := range temps {
+		c.in.Temps[k] = input{v, now}
 	}
-	for k, w := range cwhy {
-		why[k] = w
+	for k, v := range fans {
+		c.in.Fans[k] = input{v, now}
 	}
-	if len(c.in.Temps) == 0 { // the first good read decides which sensors are expected from now on
-		if hottestCPU(temps) == 0 || len(fans) == 0 {
-			c.logInputs(now, why)
-			return
-		}
-		for k := range temps {
-			c.in.Temps[k] = input{}
-		}
-		for _, k := range requiredTemps { // never seen: unknown
-			c.in.Temps[k] = input{}
-		}
-		for k := range fans {
-			c.in.Fans[k] = input{}
-		}
-		log.Printf("temperature sensors: %s; fans: %d", fmtTemps(temps), len(fans))
-	}
-	// required_temps follow the config (also after a reload, or state carried over from a run with
-	// other settings): a required one is expected even unseen. Only a key never seen can go, so a
-	// sensor fanctl discovered stays expected whatever required_temps says.
-	for _, k := range requiredTemps {
-		if _, ok := c.in.Temps[k]; !ok {
-			c.in.Temps[k] = input{}
-		}
-	}
-	for k := range c.in.Temps {
-		if v, ok := temps[k]; ok {
-			c.in.Temps[k] = input{v, now}
-		}
-	}
-	for k, in := range c.in.Temps {
-		if in.Seen.IsZero() && !slices.Contains(requiredTemps, k) {
-			delete(c.in.Temps, k)
-		}
-	}
-	for k := range c.in.Fans {
-		if v, ok := fans[k]; ok {
-			c.in.Fans[k] = input{v, now}
-		}
-	}
-	// the cap is read back every inputs.reassert (a write verifies it too, see act); a hung BMC
+	// the cap is read back every inputs.reassert (setCap's own read-back covers writes); a hung BMC
 	// costs one timeout per cycle, not two
 	if !c.bmcDown && now.Sub(c.in.Cap.Seen) >= reassert {
 		if pl, err := c.bmc.GetPowerLimit(); err == nil {
@@ -234,13 +202,13 @@ func (c *controller) sense(now time.Time) {
 			why["power cap"] = err.Error()
 		}
 	}
-	if clamped, err := clampState(); err == nil { // an input only when safe uses the clamp (readings)
+	if clamped, err := clampState(); err == nil {
 		c.in.Clamp = input{map[bool]float64{false: 0, true: 1}[clamped], now}
 	} else {
 		why["CPU clamp"] = err.Error()
 	}
-	c.senseDrives(now)
-	c.logInputs(now, why)
+	c.senseDrives()
+	c.readWhy = why
 }
 
 // senseBMC reads the BMC's temperatures (all but the CPUs: those come from coretemp), fans and wall
@@ -333,7 +301,9 @@ func senseCoretemp() (cpus map[string]float64, why map[string]string) {
 
 // senseDrives takes the drive goroutine's latest snapshot. The scan decides which drives are
 // expected (a removal is only accepted once a second scan agrees, see hddLoop).
-func (c *controller) senseDrives(now time.Time) {
+// senseDrives takes the drive goroutine's latest snapshot: the scan (count and serials) and each
+// plausible drive temperature, stamped with the snapshot's time.
+func (c *controller) senseDrives() {
 	hdds.Lock()
 	ids, raw, at, scanned := hdds.ids, hdds.temps, hdds.at, hdds.scanned
 	hdds.Unlock()
@@ -345,46 +315,20 @@ func (c *controller) senseDrives(now time.Time) {
 			log.Printf("%sdrive %s: implausible temperature %g C", prWarn, d.Serial, t)
 		}
 	}
+	c.hddSnap = at
 	st.Lock()
 	st.hdd = temps
 	st.Unlock()
 	if !scanned { // nothing known yet this run: the drive inputs keep their carried-over ages
 		return
 	}
-	if len(ids) >= hddMin {
-		c.in.Drives = at
-	}
-	keep, missing := map[string]bool{}, []string{}
+	c.in.Scan, c.in.Drives = input{float64(len(ids)), at}, nil
 	for _, d := range ids {
-		keep[d.Serial] = true
-		if t, ok := temps[d]; ok {
-			if at.After(c.in.HDD[d.Serial].Seen) {
-				c.in.HDD[d.Serial] = input{t, at}
-			}
-		} else {
-			missing = append(missing, d.Serial)
-			if _, known := c.in.HDD[d.Serial]; !known {
-				c.in.HDD[d.Serial] = input{}
-			}
+		c.in.Drives = append(c.in.Drives, d.Serial)
+		if t, ok := temps[d]; ok && at.After(c.in.HDD[d.Serial].Seen) {
+			c.in.HDD[d.Serial] = input{t, at}
 		}
 	}
-	for s := range c.in.HDD {
-		if !keep[s] {
-			delete(c.in.HDD, s)
-		}
-	}
-	if len(missing) > 0 {
-		if now.Sub(c.lastKick) >= kickEvery {
-			c.kickDrives(now) // re-read (and, for a pulled drive, rescan) now instead of in inputs.hdd_interval
-		}
-		if at != c.hddSnap {
-			log.Printf("%sdrive temperature missing: %v", prWarn, missing)
-		}
-	}
-	if len(ids) < hddMin && at != c.hddSnap {
-		log.Printf("%sonly %d drives found (inputs.hdd_min %d)", prWarn, len(ids), hddMin)
-	}
-	c.hddSnap = at
 }
 
 func (c *controller) kickDrives(now time.Time) {
@@ -397,42 +341,32 @@ func (c *controller) kickDrives(now time.Time) {
 
 // logInputs logs every expected temperature and fan that didn't read valid this cycle, with the
 // source's answer: a warning while its last value still stands in, an error once it is unknown.
-func (c *controller) logInputs(now time.Time, why map[string]string) {
+func (c *controller) logInputs(ns []named) {
 	c.held = c.held[:0]
-	if w := why["*"]; w != "" {
+	if w := c.readWhy["*"]; w != "" {
 		log.Printf("%sBMC: %s", prWarn, w)
 	}
-	one := func(kind, k, unit string, in input) {
-		if in.Seen.Equal(now) {
-			return
-		}
-		w := why[k]
+	for _, n := range ns {
+		w := c.readWhy[n.key]
 		if w == "" {
-			w = why["*"]
-		}
-		if w == "" && isCPU(k) {
-			w = "no coretemp package sensor"
+			w = c.readWhy["*"]
 		}
 		if w == "" {
-			w = "not in reply"
+			w = "no reading"
 		}
-		od := c.overdue(in.Seen, interval, now)
-		switch {
-		case in.Seen.IsZero():
-			log.Printf("%s%s %s: no reading yet (%s): unknown", prErr, kind, k, w)
-		case od < unknownAfter:
-			c.held = append(c.held, k)
-			log.Printf("%s%s %s: no reading (%s) for %s: holding %g%s", prWarn, kind, k, w,
-				now.Sub(in.Seen).Round(time.Second), in.V, unit)
-		default:
-			log.Printf("%s%s %s: no reading (%s), %s past due: unknown", prErr, kind, k, w, od.Round(time.Second))
+		switch r := n.r.(type) {
+		case NeverSeen:
+			log.Printf("%s%s: never read (%s): unknown", prErr, n.key, w)
+		case Stale:
+			switch {
+			case r.Overdue < 0: // not due yet
+			case r.Overdue < unknownAfter:
+				c.held = append(c.held, n.key)
+				log.Printf("%s%s: %s, %s past due: holding %g", prWarn, n.key, w, r.Overdue.Round(time.Second), r.V)
+			default:
+				log.Printf("%s%s: %s, %s past due: unknown", prErr, n.key, w, r.Overdue.Round(time.Second))
+			}
 		}
-	}
-	for _, k := range sortedKeys(c.in.Temps) {
-		one("temperature", k, "C", c.in.Temps[k])
-	}
-	for _, k := range sortedKeys(c.in.Fans) {
-		one("fan", k, " rpm", c.in.Fans[k])
 	}
 }
 
@@ -488,7 +422,8 @@ const (
 	kindExhaust
 	kindOtherTemp // inlet: no limit of its own
 	kindFan
-	kindOther // drive scan, actuators: only "known or not"
+	kindDriveCount // drives found by the scan: fewer than inputs.hdd_min -> unknown
+	kindOther      // read-backs: only "known or not"
 )
 
 type named struct {
@@ -510,7 +445,13 @@ func readingOf(in input, period time.Duration, now time.Time) Reading {
 // readings: every input this cycle, in a fixed order.
 func (c *controller) readings(now time.Time) []named {
 	var out []named
-	for _, k := range sortedKeys(c.in.Temps) {
+	temps := maps.Clone(c.in.Temps)
+	for _, k := range requiredTemps { // required: counted even if never read
+		if _, ok := temps[k]; !ok {
+			temps[k] = input{}
+		}
+	}
+	for _, k := range sortedKeys(temps) {
 		kd := kindOtherTemp
 		switch {
 		case isCPU(k):
@@ -518,15 +459,17 @@ func (c *controller) readings(now time.Time) []named {
 		case k == "Exhaust":
 			kd = kindExhaust
 		}
-		out = append(out, named{k, kd, readingOf(c.in.Temps[k], interval, now)})
+		out = append(out, named{k, kd, readingOf(temps[k], interval, now)})
 	}
 	for _, k := range sortedKeys(c.in.Fans) {
 		out = append(out, named{k, kindFan, readingOf(c.in.Fans[k], interval, now)})
 	}
-	for _, k := range sortedKeys(c.in.HDD) {
+	drives := slices.Clone(c.in.Drives)
+	sort.Strings(drives)
+	for _, k := range drives { // the drives of the last scan
 		out = append(out, named{"drive " + k, kindDrive, readingOf(c.in.HDD[k], hddInterval+driveSlack, now)})
 	}
-	out = append(out, named{"drive scan", kindOther, readingOf(input{1, c.in.Drives}, hddInterval+driveSlack, now)})
+	out = append(out, named{"drive scan", kindDriveCount, readingOf(c.in.Scan, hddInterval+driveSlack, now)})
 	out = append(out, named{"power cap", kindOther, readingOf(c.in.Cap, reassert, now)})
 	if safeClamp {
 		out = append(out, named{"CPU clamp", kindOther, readingOf(c.in.Clamp, interval, now)})
@@ -598,6 +541,10 @@ func classify(n named) Class {
 		if v < fanMinRPM { // commanded but not turning: the fan actuator isn't doing what it's told
 			return classUnknown
 		}
+	case kindDriveCount:
+		if v < float64(hddMin) { // drives missing, or the PERC lost them: not "fewer drives to watch"
+			return classUnknown
+		}
 	}
 	return classOK
 }
@@ -665,6 +612,12 @@ func (c *controller) choose(now time.Time) (name, why string, ns []named) {
 			delete(c.danger, k)
 		}
 	}
+	c.logInputs(ns)
+	for _, k := range c.in.Drives { // a drive without a temperature in the last scan: re-read it now
+		if c.in.HDD[k].Seen.Before(c.in.Scan.Seen) && now.Sub(c.lastKick) >= kickEvery {
+			c.kickDrives(now)
+		}
+	}
 	if len(c.in.Temps) == 0 || len(c.in.Fans) == 0 { // no sensor set yet: everything unknown
 		worst, worstKey = max(worst, classUnknown), "no sensor data yet"
 	}
@@ -709,9 +662,7 @@ func (c *controller) ctlModel(ns []named, now time.Time) error {
 	st.Lock()
 	st.demand, st.hasDemand, st.exhExpected = r.d, true, r.exhExpected
 	st.Unlock()
-	c.setClamp(false, r.why)
-	c.setCap(capW, r.why, now)
-	c.setFans(strconv.Itoa(max(0, min(modelCeiling, int(math.Round(r.target))))), r.why, now)
+	c.apply(strconv.Itoa(max(0, min(modelCeiling, int(math.Round(r.target))))), capW, false, r.why, now)
 	return nil
 }
 
@@ -720,16 +671,12 @@ func (c *controller) ctlFixed(now time.Time) {
 	st.Lock()
 	pct := st.fixed
 	st.Unlock()
-	c.setClamp(false, "fixed")
-	c.setCap(int(pcapMax), "fixed", now)
-	c.setFans(strconv.Itoa(pct), "fixed", now)
+	c.apply(strconv.Itoa(pct), int(pcapMax), false, "fixed", now)
 }
 
 // ctlIdrac: the iDRAC runs the fans.
 func (c *controller) ctlIdrac(now time.Time) {
-	c.setClamp(false, "mode=idrac")
-	c.setCap(int(pcapMax), "mode=idrac", now)
-	c.setFans("auto", "mode=idrac", now)
+	c.apply("auto", int(pcapMax), false, "mode=idrac", now)
 }
 
 // safeWindow: how long the safe controller may take to be in effect by its read-backs (the fans
@@ -739,16 +686,15 @@ const safeWindow = 15 * time.Second
 // ctlSafe: [safe] from the config (tested 2026-11-10: 20 % with the CPUs at minimum power holds a full
 // load). It must be in effect by its read-backs within safeWindow; if not: shutdown, the last resort.
 func (c *controller) ctlSafe(why string, now time.Time) {
-	c.setFans(strconv.Itoa(int(safeDuty)), why, now)
-	c.setCap(int(safeCap), why, now)
-	c.setClamp(safeClamp, why)
 	if c.state != "safe" {
 		c.safeOK = now // just entered: the fans need a moment to reach safe.duty
 	} else if bad := c.safeMismatch(now); bad == "" {
 		c.safeOK = now
 	} else if now.Sub(c.safeOK) >= safeWindow {
 		c.ctlShutdown("safe not established: " + bad)
+		return
 	}
+	c.apply(strconv.Itoa(int(safeDuty)), int(safeCap), safeClamp, why, now)
 }
 
 // ctlShutdown: the poweroff first, so nothing after it can delay or stop it; then, once, the fans to
@@ -765,11 +711,9 @@ func (c *controller) ctlShutdown(why string) {
 			c.poweredOff = true
 		}
 	}
-	if !c.shutdownTried {
+	if !c.shutdownTried { // once; a failure doesn't matter, the machine is going down
 		c.shutdownTried = true
-		try("shutdown: fans to the iDRAC", func() { _ = c.bmc.FanAuto() })
-		try("shutdown: power cap", func() { _ = c.bmc.SetPowerCap(int(pcapMin)) })
-		try("shutdown: CPU clamp", func() { _, _ = clampOn() })
+		try("shutdown: hand-over", func() { c.apply("auto", int(pcapMin), true, why, time.Now()) })
 	}
 }
 
@@ -895,6 +839,14 @@ func (c *controller) normal(temps, hdd map[string]float64, watts float64) (decis
 
 // ---------- writing: what the controllers call ----------
 
+// apply: the three actuators, always in this order: the clamp first (local, works without the BMC),
+// then the power cap, then the fans. Each writes only what differs.
+func (c *controller) apply(fans string, capW int, clamp bool, why string, now time.Time) {
+	c.setClamp(clamp, why)
+	c.setCap(capW, why, now)
+	c.setFans(fans, why, now)
+}
+
 // setFans: the duty ("auto": the iDRAC's control) when it isn't what was last written, and again every
 // inputs.reassert (retakes the fans after an iDRAC reset).
 func (c *controller) setFans(want, why string, now time.Time) {
@@ -945,6 +897,7 @@ func (c *controller) setClamp(on bool, why string) {
 	} else {
 		changed, err = clampOff()
 	}
+	c.clamp.result(strconv.FormatBool(on), err, time.Time{})
 	switch {
 	case err != nil:
 		log.Printf("%sCPU clamp on=%v failed: %v", prErr, on, err)
@@ -1034,7 +987,7 @@ func (c *controller) cycle(now time.Time) {
 	c.state, c.why = name, why
 	try("save", func() { c.saveState(now) })
 	st.Lock()
-	st.state, st.reason, st.clamped = name, why, c.in.Clamp.V == 1
+	st.state, st.reason, st.clamped = name, why, c.clamp.have == "true"
 	st.auto, st.duty = 0, -1
 	if c.fan.have == "auto" {
 		st.auto = 1
@@ -1147,6 +1100,11 @@ func (c *controller) loadState() {
 	}
 	c.in = s.In
 	c.in.init()
+	for k, in := range c.in.Temps { // placeholders from older builds: never-read inputs aren't stored
+		if in.Seen.IsZero() {
+			delete(c.in.Temps, k)
+		}
+	}
 	log.Printf("inputs from %s (saved %s ago): %d temperatures, %d fans, %d drives", stateFile,
 		c.now().Sub(s.Saved).Round(time.Second), len(c.in.Temps), len(c.in.Fans), len(c.in.HDD))
 }
