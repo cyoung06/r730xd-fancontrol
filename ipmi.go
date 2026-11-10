@@ -352,13 +352,21 @@ func (b *BMC) Sensors() ([]Sensor, error) {
 
 // Reading returns the converted value, or ok=false when the BMC has no reading for the sensor
 // (absent device, scanning disabled) - those are skipped, like ipmitool's "no reading".
-func (b *BMC) Reading(s Sensor) (float64, bool, error) {
+// Reading returns a sensor's value; ok=false with why (the BMC's answer) when there is no reading.
+func (b *BMC) Reading(s Sensor) (v float64, ok bool, why string, err error) {
 	cc, d, err := b.Raw(s.LUN, 0x04, 0x2d, []byte{s.Num})
 	if err != nil {
-		return 0, false, err
+		return 0, false, "", err
 	}
-	if cc != 0 || len(d) < 2 || d[1]&0x40 == 0 || d[1]&0x20 != 0 { // bit 6: scanning enabled, bit 5: unavailable
-		return 0, false, nil
+	switch { // status byte d[1]: bit 6 = scanning enabled, bit 5 = reading unavailable
+	case cc != 0:
+		return 0, false, fmt.Sprintf("completion code 0x%02x", cc), nil
+	case len(d) < 2:
+		return 0, false, fmt.Sprintf("short reply % x", d), nil
+	case d[1]&0x20 != 0:
+		return 0, false, fmt.Sprintf("reading unavailable, status 0x%02x", d[1]), nil
+	case d[1]&0x40 == 0:
+		return 0, false, fmt.Sprintf("scanning disabled, status 0x%02x", d[1]), nil
 	}
 	var x float64
 	switch s.format {
@@ -398,5 +406,5 @@ func (b *BMC) Reading(s Sensor) (float64, bool, error) {
 	case 11:
 		y = math.Cbrt(y)
 	}
-	return y, true, nil
+	return y, true, "", nil
 }

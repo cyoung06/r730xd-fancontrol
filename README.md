@@ -92,7 +92,8 @@ in control:
 | failure | what happens |
 |---|---|
 | sensor read fails, BMC times out | fans → iDRAC auto, retried next cycle |
-| a temperature sensor stops reporting, a `REQUIRED_TEMPS` sensor has no reading, or one reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
+| a temperature or fan reading goes missing | last reading reused (warning logged each read); after 20 s also duty ≥ 25 %, CPUs clamped to their lowest frequency (turbo off, `intel_pstate` `max_perf_pct` = min) and iDRAC power cap at `PCAP_MIN`, error logged each read, until it reports again. A sensor never seen with a value → iDRAC auto. Both throttles failing → iDRAC auto. (`fanctl_sensor_gap_level` 1/2, `fanctl_cpu_throttled`) |
+| a `REQUIRED_TEMPS` sensor has no reading, or one reads implausibly (≤ 0 or ≥ 127 °C) | fans → iDRAC auto (a missing CPU reading never counts as "cool") |
 | a fan disappears or drops below `FAN_MIN_RPM` | fans → iDRAC auto (it compensates with the others) |
 | fewer than `HDD_MIN` drives visible; a drive missing from one rescan | fans → iDRAC auto (a shrink is accepted only when the next scan agrees) |
 | a hand-back to the iDRAC fails | re-sent every cycle until it succeeds |
@@ -103,7 +104,7 @@ in control:
 | panic in a control cycle (bug, unexpected BMC reply) | recovered: fans → iDRAC auto, next cycle retries |
 | panic in the drive reader | recovered and restarted; stale drive data → iDRAC auto meanwhile |
 | CPU ≥ `CPU_AUTO`, drive ≥ `HDD_AUTO`, exhaust ≥ `EXHAUST_AUTO` | fans → iDRAC auto |
-| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` (retries for up to 12 s), restart after 5 s |
+| fanctl stops, crashes or is killed | systemd `ExecStopPost=fanctl auto` (retries for up to 12 s) also undoes a CPU clamp (saved in `/run/fanctl/throttle`), restart after 5 s |
 | control loop hangs | systemd `WatchdogSec=60` kills it → `ExecStopPost` → restart |
 | whole OS hangs | optional BMC hardware watchdog resets the server |
 | boot | `fanctl-failsafe.service` sets iDRAC auto before fanctl starts |

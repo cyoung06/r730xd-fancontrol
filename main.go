@@ -19,6 +19,7 @@ package main
 
 import (
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -328,6 +329,8 @@ var st = struct {
 	modelOn, hasDemand bool
 	demand             demand
 	exhExpected        float64 // 0 = not computed (no model or no drive temperature)
+	gap                int     // controller.gapLevel of the last read
+	throttled          bool    // CPUs throttled for a sensor gap
 }{duty: -1, auto: 1, reason: "start"}
 
 // drive temperatures, refreshed by their own goroutine so a slow or hung drive never stalls the loop
@@ -526,6 +529,217 @@ type controller struct {
 	hotHist         []float64 // hottest CPU, last 60 s
 	raplOff         float64   // learned wall - RAPL offset (W); valid when raplLearned
 	raplLearned     bool
+
+	// sensor gaps (the iDRAC drops a reading for ~10 s now and then)
+	tempGaps, fanGaps gapTracker
+	gapLevel          int  // this cycle: 0 all real, 1 holding a last value, 2 holding + floor + throttle
+	throttled         bool // CPU clamp / PCAP_MIN applied for a gap
+}
+
+// A missing temperature or fan reading is replaced by its last real value. After gapHold the duty
+// is held at >= gapFloor and the CPUs are throttled (frequency clamp + iDRAC cap at PCAP_MIN) until
+// the reading returns.
+const (
+	gapFloor = 25.0
+	gapHold  = 20 * time.Second
+)
+
+// journald priority prefixes (SyslogLevelPrefix): what a log watcher filters on
+const (
+	prErr  = "<3>"
+	prWarn = "<4>"
+)
+
+type gapTracker struct {
+	last map[string]float64   // last real reading
+	gone map[string]time.Time // first cycle without a reading, while it is missing
+	miss map[string]int       // cycles without a reading, while it is missing
+}
+
+// fill puts the last real value into m for each expected key that has no reading this cycle and
+// returns the gap level (0-2). why holds the BMC's answer for each rejected reading. A key never
+// seen with a value has nothing to hold: error.
+func (g *gapTracker) fill(kind, unit string, m map[string]float64, expect map[string]bool, why map[string]string, now time.Time) (int, error) {
+	if g.last == nil {
+		g.last, g.gone, g.miss = map[string]float64{}, map[string]time.Time{}, map[string]int{}
+	}
+	keys := make([]string, 0, len(expect))
+	for k := range expect {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	level := 0
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if since, gone := g.gone[k]; gone {
+				log.Printf("%s%s %s reading back after %d missed reads (%s): %g%s", prWarn, kind, k, g.miss[k], now.Sub(since).Round(time.Second), v, unit)
+				delete(g.gone, k)
+				delete(g.miss, k)
+			}
+			g.last[k] = v
+			continue
+		}
+		w := why[k]
+		if w == "" {
+			w = "not in reply"
+		}
+		last, have := g.last[k]
+		if !have {
+			return level, fmt.Errorf("%s %s stopped reporting (%s), no earlier reading", kind, k, w)
+		}
+		since, gone := g.gone[k]
+		if !gone {
+			since = now
+			g.gone[k] = now
+		}
+		g.miss[k]++
+		d := now.Sub(since)
+		if d < gapHold {
+			log.Printf("%s%s %s: no reading (%s), missed %d for %s: holding last %g%s",
+				prWarn, kind, k, w, g.miss[k], d.Round(time.Second), last, unit)
+			level = max(level, 1)
+		} else {
+			log.Printf("%s%s %s: no reading (%s), missed %d for %s: holding last %g%s, duty >= %.0f%%, CPU throttled",
+				prErr, kind, k, w, g.miss[k], d.Round(time.Second), last, unit, gapFloor)
+			level = 2
+		}
+		m[k] = last
+	}
+	return level, nil
+}
+
+// fillGaps fills missing temperature and fan readings (see gapTracker) and sets c.gapLevel.
+func (c *controller) fillGaps(temps, fans map[string]float64, why map[string]string, now time.Time) (err error) {
+	c.gapLevel = 0
+	defer func() {
+		st.Lock()
+		st.gap = c.gapLevel
+		st.Unlock()
+	}()
+	lt, err := c.tempGaps.fill("temperature", "C", temps, c.expect, why, now)
+	c.gapLevel = lt
+	if err != nil {
+		return err
+	}
+	lf, err := c.fanGaps.fill("fan", " rpm", fans, c.fansSeen, why, now)
+	c.gapLevel = max(lt, lf)
+	return err
+}
+
+// ---------- CPU throttle (RAPL is locked by the BIOS: clamp the frequency through intel_pstate) ----------
+
+var (
+	pstateDir     = "/sys/devices/system/cpu/intel_pstate"
+	throttleState = "/run/fanctl/throttle" // the values the clamp replaced; present while clamped
+)
+
+func readTrim(p string) (string, error) {
+	b, err := os.ReadFile(p)
+	return strings.TrimSpace(string(b)), err
+}
+
+func writePstate(name, v string) error {
+	if err := os.WriteFile(pstateDir+"/"+name, []byte(v), 0); err != nil {
+		return fmt.Errorf("intel_pstate %s=%s: %w", name, v, err)
+	}
+	return nil
+}
+
+// throttleOn turns turbo off and caps the CPUs at their lowest frequency, saving the old settings
+// first (a crash while clamped is undone by "fanctl auto" or the next start). Idempotent.
+func throttleOn() error {
+	if _, err := os.Stat(throttleState); err != nil {
+		nt, err1 := readTrim(pstateDir + "/no_turbo")
+		mx, err2 := readTrim(pstateDir + "/max_perf_pct")
+		if err := errors.Join(err1, err2); err != nil {
+			return fmt.Errorf("read intel_pstate: %w", err)
+		}
+		if err := os.WriteFile(throttleState, []byte(nt+" "+mx+"\n"), 0o644); err != nil {
+			return fmt.Errorf("save CPU settings before the clamp: %w", err)
+		}
+	}
+	mn, err := readTrim(pstateDir + "/min_perf_pct")
+	if err != nil {
+		return fmt.Errorf("read intel_pstate: %w", err)
+	}
+	return errors.Join(writePstate("no_turbo", "1"), writePstate("max_perf_pct", mn))
+}
+
+// throttleOff restores what throttleOn saved (restored=false: nothing was clamped).
+func throttleOff() (restored bool, err error) {
+	b, err := os.ReadFile(throttleState)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	f := strings.Fields(string(b))
+	if len(f) != 2 {
+		return false, fmt.Errorf("%s: unexpected content %q", throttleState, b)
+	}
+	if err := errors.Join(writePstate("max_perf_pct", f[1]), writePstate("no_turbo", f[0])); err != nil {
+		return false, err
+	}
+	return true, os.Remove(throttleState)
+}
+
+// undoLeftClamp restores a clamp left by a run that died while throttled.
+func undoLeftClamp() {
+	if ok, err := throttleOff(); err != nil {
+		log.Printf("%sCPU frequency restore failed: %v", prErr, err)
+	} else if ok {
+		log.Printf("%sCPU frequency clamp from an earlier run undone", prWarn)
+	}
+}
+
+// throttle applies (on) or releases the gap throttle. It fails only when neither the clamp nor the
+// power cap could be applied; each failure is logged.
+func (c *controller) throttle(on bool) error {
+	if on {
+		if !c.throttled {
+			log.Printf("%sthrottling CPUs: sensor reading missing for %s", prErr, gapHold)
+		}
+		errC := throttleOn()
+		if errC != nil {
+			log.Printf("%sCPU frequency clamp failed: %v", prErr, errC)
+		}
+		var errP error
+		st.Lock()
+		capNow := st.powerCap
+		st.Unlock()
+		if !c.throttled || capNow != int(pcapMin) {
+			if errP = c.bmc.SetPowerCap(int(pcapMin)); errP != nil {
+				log.Printf("%spower cap %d W failed: %v", prErr, int(pcapMin), errP)
+			} else {
+				st.Lock()
+				st.powerCap = int(pcapMin)
+				st.Unlock()
+				log.Printf("%spower cap %d W (PCAP_MIN, sensor gap)", prWarn, int(pcapMin))
+			}
+		}
+		c.capSet = false // normal cap control starts over afterwards
+		if !c.throttled && errC != nil && errP != nil {
+			return fmt.Errorf("could not throttle the CPUs (clamp: %v; power cap: %v)", errC, errP)
+		}
+		c.throttled = errC == nil || errP == nil || c.throttled
+		st.Lock()
+		st.throttled = c.throttled
+		st.Unlock()
+		return nil
+	}
+	if !c.throttled {
+		return nil
+	}
+	if _, err := throttleOff(); err != nil {
+		log.Printf("%sCPU frequency restore failed: %v (retrying)", prErr, err)
+		return nil // stays throttled; retried next cycle
+	}
+	c.throttled, c.capSet = false, false
+	st.Lock()
+	st.throttled = false
+	st.Unlock()
+	log.Printf("%sCPU throttle released: sensor readings back", prWarn)
+	return nil
 }
 
 func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, err error) {
@@ -537,33 +751,44 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 		log.Printf("sensor repository: %d temperature/fan/power sensors", len(c.sensors))
 	}
 	temps, fans = map[string]float64{}, map[string]float64{}
+	why := map[string]string{} // rejected readings: the BMC's answer
 	for _, s := range c.sensors {
-		v, ok, err := c.bmc.Reading(s)
+		v, ok, w, err := c.bmc.Reading(s)
 		if err != nil && s.Type != sensorCurrent { // a failed power read is tolerated
-			return nil, nil, 0, err
+			return nil, nil, 0, fmt.Errorf("read %s: %w", s.Name, err)
+		}
+		var key string
+		switch s.Type {
+		case sensorTemp:
+			if s.Entity == 3 { // entity 3.x = processor x
+				key = fmt.Sprintf("CPU%d", s.Inst)
+			} else {
+				key = strings.ReplaceAll(strings.ReplaceAll(s.Name, " Temp", ""), " ", "_")
+			}
+		case sensorFan:
+			key = strings.ReplaceAll(s.Name, " RPM", "")
 		}
 		if !ok {
+			if key != "" {
+				why[key] = w
+			}
 			continue
 		}
 		switch s.Type {
 		case sensorTemp:
-			if s.Entity == 3 { // entity 3.x = processor x
-				temps[fmt.Sprintf("CPU%d", s.Inst)] = v
-			} else {
-				temps[strings.ReplaceAll(strings.ReplaceAll(s.Name, " Temp", ""), " ", "_")] = v
-			}
+			temps[key] = v
 		case sensorFan:
-			fans[strings.ReplaceAll(s.Name, " RPM", "")] = v
+			fans[key] = v
 		case sensorCurrent:
 			watts = v
 		}
 	}
 	if len(temps) == 0 || len(fans) == 0 {
 		c.sensors = nil // walk the repository again next time
-		return nil, nil, 0, fmt.Errorf("empty sensor read")
+		return nil, nil, 0, fmt.Errorf("empty sensor read (%d temperatures, %d fans; rejected: %v)", len(temps), len(fans), why)
 	}
-	// a temperature that drops out must not look like a cool part, and a garbage value must not
-	// either: both fail the cycle (-> iDRAC)
+	// a temperature that drops out for good must not look like a cool part, and a garbage value must
+	// not either: both fail the cycle (-> iDRAC)
 	if c.expect == nil {
 		if hottestCPU(temps) == 0 {
 			return nil, nil, 0, fmt.Errorf("no CPU temperature")
@@ -573,6 +798,16 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 			c.expect[k] = true
 		}
 		log.Printf("temperature sensors: %s", fmtTemps(temps))
+	}
+	if c.fansSeen == nil {
+		c.fansSeen = map[string]bool{}
+		for k := range fans {
+			c.fansSeen[k] = true
+		}
+	}
+	// a reading missing for a few cycles is bridged with its last value (gapTracker)
+	if err := c.fillGaps(temps, fans, why, time.Now()); err != nil {
+		return nil, nil, 0, err
 	}
 	for k := range c.expect {
 		if _, ok := temps[k]; !ok {
@@ -585,12 +820,6 @@ func (c *controller) readBMC() (temps, fans map[string]float64, watts float64, e
 		}
 	}
 	// a dead, stalled or vanished fan: the iDRAC compensates with the others, we can't
-	if c.fansSeen == nil {
-		c.fansSeen = map[string]bool{}
-		for k := range fans {
-			c.fansSeen[k] = true
-		}
-	}
 	for k := range c.fansSeen {
 		if v, ok := fans[k]; !ok || v < fanMinRPM {
 			return nil, nil, 0, fmt.Errorf("fan %s at %g rpm (missing or below FAN_MIN_RPM)", k, v)
@@ -641,7 +870,8 @@ func (c *controller) step() error {
 	mode, fixedPct, reason, capNow := st.mode, st.fixed, st.reason, st.powerCap
 	st.Unlock()
 
-	if mode != "model" {
+	throttle := c.gapLevel >= 2
+	if mode != "model" && !throttle {
 		c.capSet = false
 		if capNow != 0 && capNow != int(pcapMax) { // left model mode: don't leave our cap behind
 			if err := c.bmc.SetPowerCap(int(pcapMax)); err != nil {
@@ -720,7 +950,7 @@ func (c *controller) step() error {
 				} else {
 					want = math.Max(pcapMin, want)
 				}
-				if !c.capSet || math.Abs(want-c.lastCap) >= pcapStep || (want == pcapMax) != (c.lastCap == pcapMax) {
+				if !throttle && (!c.capSet || math.Abs(want-c.lastCap) >= pcapStep || (want == pcapMax) != (c.lastCap == pcapMax)) {
 					if math.IsNaN(want) || math.IsInf(want, 0) {
 						return fmt.Errorf("power cap computed as %v", want)
 					}
@@ -755,7 +985,7 @@ func (c *controller) step() error {
 			// ... and only while the model's own request (not the warm floor) sets the CPU demand
 			onCPU := !emergency && r.modelRan && r.modelPart >= r.warmPart && math.Abs(r.target-cpuEff) < 0.5 &&
 				cpuEff >= math.Max(d.hdd, d.exhaust)
-			if settled && onCPU && math.Abs(over) < 5 && !(d.cpu <= minPct && over < 0) && !(pinned && over > 0) {
+			if c.gapLevel == 0 && settled && onCPU && math.Abs(over) < 5 && !(d.cpu <= minPct && over < 0) && !(pinned && over > 0) {
 				c.modelI = math.Max(-iMax, math.Min(iMax, c.modelI+ki*over*ivl/60))
 			}
 			st.Lock()
@@ -771,6 +1001,12 @@ func (c *controller) step() error {
 	if hot := hottestCPU(temps); r.ok && hot >= cpuLimit && r.target < emergencyPct { // every mode, incl. fixed
 		r.target, r.why = emergencyPct, fmt.Sprintf("cpu %.0fC >= limit %.0f", hot, cpuLimit)
 	}
+	if r.ok && throttle && r.target < gapFloor { // a sensor reading is still missing
+		r.target, r.why = gapFloor, "sensor reading missing"
+	}
+	if err := c.throttle(throttle); err != nil {
+		return err
+	}
 	if r.ok || r.d != (demand{}) {
 		st.Lock()
 		st.demand, st.hasDemand, st.exhExpected = r.d, true, r.exhExpected
@@ -784,7 +1020,7 @@ func (c *controller) step() error {
 			return err
 		}
 		if c.manual || reason != r.why {
-			log.Printf("auto: %s", r.why)
+			log.Printf("%sauto: %s", prWarn, r.why)
 		}
 		c.manual, c.hotHist = false, nil
 	} else if !c.manual || math.Round(r.target) != math.Round(c.current) || time.Since(c.sentAt) >= reassert {
@@ -836,8 +1072,10 @@ func (c *controller) run() {
 			st.Lock()
 			st.errors++
 			st.Unlock()
-			log.Printf("error: %v -> auto", err)
-			_ = c.setAuto("error")
+			log.Printf("%serror: %v -> auto", prErr, err)
+			if err := c.setAuto("error"); err != nil {
+				log.Printf("%sfans -> iDRAC auto failed: %v", prErr, err)
+			}
 			c.manual = false
 		}
 		sdNotify("WATCHDOG=1")
@@ -987,6 +1225,8 @@ func metrics(w http.ResponseWriter, _ *http.Request) {
 	}
 	line("# TYPE fanctl_duty_percent gauge\nfanctl_duty_percent %d", st.duty)
 	line("# TYPE fanctl_auto_mode gauge\nfanctl_auto_mode %d", st.auto)
+	line("# TYPE fanctl_sensor_gap_level gauge\nfanctl_sensor_gap_level %d", st.gap)
+	line("# TYPE fanctl_cpu_throttled gauge\nfanctl_cpu_throttled %d", map[bool]int{false: 0, true: 1}[st.throttled])
 	line("# TYPE fanctl_errors_total counter\nfanctl_errors_total %d", st.errors)
 	line("# TYPE fanctl_last_read_timestamp_seconds gauge\nfanctl_last_read_timestamp_seconds %.3f", st.lastOK)
 	line(`fanctl_info{mode="%s",reason="%s"} 1`, lbl(st.mode), lbl(st.reason))
@@ -1057,6 +1297,7 @@ func fansToIDRAC(bmc *BMC) error {
 const handoffFile, handoffMaxAge = "/run/fanctl-handoff", time.Minute
 
 func cmdAuto() {
+	undoLeftClamp()
 	if fi, err := os.Stat(handoffFile); err == nil {
 		os.Remove(handoffFile)
 		if age := time.Since(fi.ModTime()); age >= 0 && age < handoffMaxAge {
@@ -1117,8 +1358,8 @@ func cmdProbe() {
 	}
 	fmt.Println("== BMC sensors")
 	for _, s := range sensors {
-		v, ok, err := bmc.Reading(s)
-		val := "no reading"
+		v, ok, why, err := bmc.Reading(s)
+		val := "no reading (" + why + ")"
 		if err != nil {
 			val = "error: " + err.Error()
 		} else if ok {
@@ -1183,6 +1424,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	undoLeftClamp()
 	c := &controller{bmc: bmc, kick: make(chan struct{}, 1), reload: make(chan func(), 1)}
 
 	// SIGUSR2 (systemctl kill -s USR2 fanctl): replace this process with the binary at the same path, e.g.

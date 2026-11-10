@@ -19,6 +19,10 @@ WatchdogSec=60
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
+# /run/fanctl/throttle: CPU settings saved while clamped; kept across a crash so ExecStopPost and
+# the next start can undo the clamp
+RuntimeDirectory=fanctl
+RuntimeDirectoryPreserve=yes
 # sandbox: root is needed only for /dev/ipmi0, the RAPL counters and the PERC ioctl (CAP_SYS_ADMIN)
 NoNewPrivileges=yes
 CapabilityBoundingSet=CAP_SYS_ADMIN
@@ -29,6 +33,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
+# ...except the CPU frequency limits: the sensor-gap throttle (RAPL itself is locked by the BIOS)
+ReadWritePaths=/sys/devices/system/cpu/intel_pstate
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
